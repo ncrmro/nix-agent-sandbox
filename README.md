@@ -100,6 +100,7 @@ The outer ring prevents the process from seeing anything outside the mount list.
 | `~/.config/claude-code` | read-write | Claude additional config |
 | `~/.gemini` | read-write | Gemini CLI auth and config |
 | `~/.codex` | read-write | Codex CLI auth and config |
+| `~/.gitconfig`, `~/.config/git` | read-only | Git user config (name, email, aliases) |
 | `/etc/ssl/certs`, `/etc/hosts` | read-only | Provided by FHS rootfs |
 | `/nix/store` | read-only | Package closures for sandboxed tools |
 
@@ -276,6 +277,7 @@ Tests cover:
 - **Tmpfs isolation**: writes to `~/` succeed but are ephemeral
 - **Project directory**: `$PWD` is readable and writable
 - **Agent config dirs**: `~/.claude`, `~/.gemini`, `~/.codex` accessible
+- **Git config**: `~/.gitconfig` readable but not writable
 - **Networking**: SSL certs, DNS resolution, HTTPS connectivity
 - **Nix store**: readable but not writable
 

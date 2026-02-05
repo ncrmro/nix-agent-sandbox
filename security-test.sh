@@ -101,6 +101,13 @@ run_test "Access ~/.codex"                           allowed "ls \$HOME/.codex 2
 run_test "Write to ~/.codex"                         allowed "touch \$HOME/.codex/.sandbox-test && rm \$HOME/.codex/.sandbox-test"
 
 echo ""
+echo "[Git Config -- must be read-only]"
+run_test "Read ~/.gitconfig"                         info "cat \$HOME/.gitconfig 2>/dev/null || test ! -e \$HOME/.gitconfig"
+run_test "Read ~/.config/git"                        info "ls \$HOME/.config/git 2>/dev/null || test ! -e \$HOME/.config/git"
+run_test "Git user.name accessible"                  info "git config --global user.name 2>/dev/null"
+run_test "Write to ~/.gitconfig blocked"             blocked "echo '[test]' >> \$HOME/.gitconfig"
+
+echo ""
 echo "[Networking -- must work for API calls]"
 run_test "SSL certificates available"                allowed "ls /etc/ssl/certs"
 run_test "resolv.conf exists"                        info "test -e /etc/resolv.conf || test -L /etc/resolv.conf"

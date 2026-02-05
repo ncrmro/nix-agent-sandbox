@@ -34,8 +34,11 @@
           # Override desktop-oriented defaults (fonts, icons, themes).
           # /etc/ssl/certs, /etc/resolv.conf, /etc/hosts are provided
           # by the FHS rootfs via /.host-etc symlinks.
-          read = pkgs.lib.mkForce (
-            extraReadPaths
+          read = pkgs.lib.mkForce ([
+            "$HOME/.gitconfig"            # git user config (name, email, aliases)
+            "$HOME/.config/git"           # git XDG config directory
+          ]
+            ++ extraReadPaths
             ++ pkgs.lib.optional (githubTokenPath != null) githubTokenPath
           );
 
