@@ -4,10 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nix-bwrapper.url = "github:Naxdy/nix-bwrapper";
-    claude-code.url = "github:sadjow/claude-code-nix";
+    llm-agents.url = "github:numtide/llm-agents.nix";
   };
 
-  outputs = { self, nixpkgs, nix-bwrapper, claude-code }:
+  outputs = { self, nixpkgs, nix-bwrapper, llm-agents }:
     let
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs supportedSystems f;
@@ -17,7 +17,7 @@
         config.allowUnfree = true;
         overlays = [
           nix-bwrapper.overlays.default
-          claude-code.overlays.default
+          llm-agents.overlays.default
           self.overlays.default
         ];
       };
@@ -131,11 +131,26 @@
 
       # ── Overlay ───────────────────────────────────────────────
       # Adds sandboxed agent packages to pkgs.
+      # Each agent runs in yolo mode since the sandbox provides OS-level isolation.
       overlays.default = final: prev: {
         claude-code-sandbox = self.lib.mkAgentSandbox {
           pkgs = final;
-          package = final.claude-code;
-          runScript = "claude";
+          package = final.llm-agents.claude-code;
+          runScript = "claude --dangerously-skip-permissions";
+          addPkgs = defaultAddPkgs final;
+        };
+
+        gemini-cli-sandbox = self.lib.mkAgentSandbox {
+          pkgs = final;
+          package = final.llm-agents.gemini-cli;
+          runScript = "gemini --yolo";
+          addPkgs = defaultAddPkgs final;
+        };
+
+        codex-sandbox = self.lib.mkAgentSandbox {
+          pkgs = final;
+          package = final.llm-agents.codex;
+          runScript = "codex --yolo";
           addPkgs = defaultAddPkgs final;
         };
       };
@@ -144,13 +159,26 @@
       packages = forAllSystems (system:
         let pkgs = mkPkgs system;
         in {
+          # ── Claude Code ────────────────────────────────────────
           # Sandboxed Claude Code (bubblewrap-wrapped)
           claude-code = pkgs.claude-code-sandbox;
-
           # Unwrapped Claude Code (no sandbox, direct binary)
-          claude-code-unwrapped = pkgs.claude-code;
+          claude-code-unwrapped = pkgs.llm-agents.claude-code;
 
-          # Default package is the sandboxed version
+          # ── Gemini CLI ─────────────────────────────────────────
+          # Sandboxed Gemini CLI (bubblewrap-wrapped)
+          gemini-cli = pkgs.gemini-cli-sandbox;
+          gemini = pkgs.gemini-cli-sandbox;  # alias
+          # Unwrapped Gemini CLI (no sandbox, direct binary)
+          gemini-cli-unwrapped = pkgs.llm-agents.gemini-cli;
+
+          # ── OpenAI Codex ───────────────────────────────────────
+          # Sandboxed Codex (bubblewrap-wrapped)
+          codex = pkgs.codex-sandbox;
+          # Unwrapped Codex (no sandbox, direct binary)
+          codex-unwrapped = pkgs.llm-agents.codex;
+
+          # Default package is the sandboxed Claude Code
           default = pkgs.claude-code-sandbox;
 
           # Security test runner — validates sandbox isolation
@@ -176,17 +204,28 @@
       devShells = forAllSystems (system:
         let pkgs = mkPkgs system;
         in {
+          # All agents sandboxed
           default = pkgs.mkShell {
             packages = [
-              pkgs.claude-code-sandbox    # sandboxed
+              pkgs.claude-code-sandbox
+              pkgs.gemini-cli-sandbox
+              pkgs.codex-sandbox
             ];
           };
 
+          # All agents unwrapped (no sandbox)
           unwrapped = pkgs.mkShell {
             packages = [
-              pkgs.claude-code            # unwrapped (no sandbox)
+              pkgs.llm-agents.claude-code
+              pkgs.llm-agents.gemini-cli
+              pkgs.llm-agents.codex
             ];
           };
+
+          # Individual agent shells
+          claude = pkgs.mkShell { packages = [ pkgs.claude-code-sandbox ]; };
+          gemini = pkgs.mkShell { packages = [ pkgs.gemini-cli-sandbox ]; };
+          codex = pkgs.mkShell { packages = [ pkgs.codex-sandbox ]; };
         }
       );
     };

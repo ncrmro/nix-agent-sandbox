@@ -6,17 +6,56 @@ Wraps agent CLIs in Linux kernel namespaces so the process can only see an expli
 
 ## Quick start
 
-Run sandboxed Claude Code in the current directory:
+### Claude Code
 
 ```bash
+# Run sandboxed Claude Code in current directory (yolo mode enabled)
+cd ~/projects/my-app
 nix run github:ncrmro/nix-agent-sandbox
+
+# Or explicitly
+nix run github:ncrmro/nix-agent-sandbox#claude-code
+
+# Pass additional arguments
+nix run github:ncrmro/nix-agent-sandbox -- "fix the failing tests"
 ```
 
-Run without the sandbox (unwrapped):
+### Gemini CLI
+
+```bash
+# Run sandboxed Gemini CLI in current directory (yolo mode enabled)
+cd ~/projects/my-app
+nix run github:ncrmro/nix-agent-sandbox#gemini-cli
+
+# Or use the alias
+nix run github:ncrmro/nix-agent-sandbox#gemini
+
+# Pass additional arguments
+nix run github:ncrmro/nix-agent-sandbox#gemini -- "explain this codebase"
+```
+
+### OpenAI Codex
+
+```bash
+# Run sandboxed Codex in current directory (yolo mode enabled)
+cd ~/projects/my-app
+nix run github:ncrmro/nix-agent-sandbox#codex
+
+# Pass additional arguments
+nix run github:ncrmro/nix-agent-sandbox#codex -- "add unit tests for the auth module"
+```
+
+### Unwrapped (no sandbox)
+
+If you need full filesystem access without the bubblewrap sandbox:
 
 ```bash
 nix run github:ncrmro/nix-agent-sandbox#claude-code-unwrapped
+nix run github:ncrmro/nix-agent-sandbox#gemini-cli-unwrapped
+nix run github:ncrmro/nix-agent-sandbox#codex-unwrapped
 ```
+
+### Security validation
 
 Validate that sandbox isolation is working:
 
@@ -28,8 +67,12 @@ nix run github:ncrmro/nix-agent-sandbox#security-test
 
 | Package | Description |
 |---------|-------------|
-| `default` / `claude-code` | Claude Code wrapped in bubblewrap |
-| `claude-code-unwrapped` | Claude Code without sandbox (direct binary from [claude-code-nix](https://github.com/sadjow/claude-code-nix)) |
+| `default` / `claude-code` | Claude Code in bubblewrap (yolo mode) |
+| `claude-code-unwrapped` | Claude Code without sandbox |
+| `gemini-cli` / `gemini` | Gemini CLI in bubblewrap (yolo mode) |
+| `gemini-cli-unwrapped` | Gemini CLI without sandbox |
+| `codex` | OpenAI Codex in bubblewrap (yolo mode) |
+| `codex-unwrapped` | OpenAI Codex without sandbox |
 | `security-test` | Validation script that runs inside the sandbox to confirm isolation |
 
 ## How the sandbox works
@@ -44,7 +87,9 @@ Host OS
   |         Command filtering, network restrictions, file controls
 ```
 
-The outer ring prevents the process from seeing anything outside the mount list. The inner ring provides granular control within those mounts. Together, `--dangerously-skip-permissions` becomes safer because the kernel constrains the blast radius.
+The outer ring prevents the process from seeing anything outside the mount list. The inner ring provides granular control within those mounts.
+
+**Sandboxed packages run in yolo mode by default** (`--dangerously-skip-permissions` for Claude, `--yolo` for Gemini/Codex). This is safe because the kernel constrains the blast radius — the agent can only access `$PWD` and its config directories regardless of what commands it runs.
 
 ### What the agent can access
 
@@ -68,7 +113,7 @@ The sandbox includes: `git`, `ripgrep`, `fd`, `coreutils`, `bash`, `grep`, `sed`
 
 ### Using the overlay (recommended)
 
-Add `nix-agent-sandbox` as a flake input and apply the overlay. This gives you `pkgs.claude-code-sandbox` alongside your other packages.
+Add `nix-agent-sandbox` as a flake input and apply the overlay. This gives you `pkgs.claude-code-sandbox`, `pkgs.gemini-cli-sandbox`, and `pkgs.codex-sandbox` alongside your other packages.
 
 ```nix
 {
@@ -91,13 +136,17 @@ Add `nix-agent-sandbox` as a flake input and apply the overlay. This gives you `
         default = pkgs.mkShell {
           packages = [
             pkgs.claude-code-sandbox
+            pkgs.gemini-cli-sandbox
+            pkgs.codex-sandbox
           ];
         };
 
         # Unwrapped: full filesystem access, agent's own sandbox only
         unwrapped = pkgs.mkShell {
           packages = [
-            pkgs.claude-code
+            pkgs.llm-agents.claude-code
+            pkgs.llm-agents.gemini-cli
+            pkgs.llm-agents.codex
           ];
         };
       };
@@ -123,8 +172,9 @@ If you don't want to use the overlay, reference packages from the flake input:
     in {
       devShells.${system}.default = pkgs.mkShell {
         packages = [
-          nix-agent-sandbox.packages.${system}.claude-code       # sandboxed
-          # nix-agent-sandbox.packages.${system}.claude-code-unwrapped  # or unwrapped
+          nix-agent-sandbox.packages.${system}.claude-code   # sandboxed
+          nix-agent-sandbox.packages.${system}.gemini-cli    # sandboxed
+          nix-agent-sandbox.packages.${system}.codex         # sandboxed
         ];
       };
     };
@@ -239,5 +289,5 @@ Tests cover:
 ## Credits
 
 - [nix-bwrapper](https://github.com/Naxdy/nix-bwrapper) by Naxdy
-- [claude-code-nix](https://github.com/sadjow/claude-code-nix) by sadjow
+- [llm-agents.nix](https://github.com/numtide/llm-agents.nix) by numtide
 - [bubblewrap](https://github.com/containers/bubblewrap) by the containers project
