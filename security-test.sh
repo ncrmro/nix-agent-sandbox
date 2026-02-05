@@ -99,11 +99,12 @@ run_test "Access ~/.codex"                           allowed "ls \$HOME/.codex 2
 run_test "Write to ~/.codex"                         allowed "touch \$HOME/.codex/.sandbox-test && rm \$HOME/.codex/.sandbox-test"
 
 echo ""
-echo "[Git Config -- must be read-only]"
+echo "[Git Config]"
 run_test "Read ~/.gitconfig"                         info "cat \$HOME/.gitconfig 2>/dev/null || test ! -e \$HOME/.gitconfig"
-run_test "Read ~/.config/git"                        info "ls \$HOME/.config/git 2>/dev/null || test ! -e \$HOME/.config/git"
 run_test "Git user.name accessible"                  info "git config --global user.name 2>/dev/null"
 run_test "Write to ~/.gitconfig blocked"             blocked "echo '[test]' >> \$HOME/.gitconfig"
+run_test "Access ~/.config/git"                      allowed "ls \$HOME/.config/git 2>/dev/null || mkdir -p \$HOME/.config/git"
+run_test "Write to ~/.config/git"                    allowed "touch \$HOME/.config/git/.sandbox-test && rm \$HOME/.config/git/.sandbox-test"
 
 echo ""
 echo "[SSH Keys -- must be read-only]"

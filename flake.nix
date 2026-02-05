@@ -36,7 +36,6 @@
           # by the FHS rootfs via /.host-etc symlinks.
           read = pkgs.lib.mkForce ([
             "$HOME/.gitconfig"            # git user config (name, email, aliases)
-            "$HOME/.config/git"           # git XDG config directory
             "$HOME/.ssh"                  # SSH keys for git operations
           ]
             ++ extraReadPaths
@@ -47,6 +46,7 @@
             "$PWD"                          # current project directory
             "$HOME/.claude"                 # claude auth + config
             "$HOME/.config/claude-code"     # claude additional config
+            "$HOME/.config/git"             # git XDG config (needs write for credential helpers)
             "$HOME/.gemini"                 # gemini auth + config
             "$HOME/.codex"                  # codex auth + config
           ] ++ extraReadWritePaths);
