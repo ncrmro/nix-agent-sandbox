@@ -51,6 +51,19 @@
         };
 
         fhsenv.skipExtraInstallCmds = true;
+        # mkBwrapper names the output bin/<pname> (e.g. bin/claude-code)
+        # but agents often expect the short name (e.g. bin/claude).
+        # Create a symlink so both names work and nix run finds mainProgram.
+        fhsenv.extraInstallCmds = ''
+          for bin in $out/bin/*; do
+            name="$(basename "$bin")"
+            # If pname has a hyphenated suffix, symlink the short form
+            short="''${name%%-*}"
+            if [ "$short" != "$name" ] && [ ! -e "$out/bin/$short" ]; then
+              ln -s "$bin" "$out/bin/$short"
+            fi
+          done
+        '';
 
         sockets = {
           x11 = false;
