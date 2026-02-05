@@ -101,10 +101,11 @@ The outer ring prevents the process from seeing anything outside the mount list.
 | `~/.gemini` | read-write | Gemini CLI auth and config |
 | `~/.codex` | read-write | Codex CLI auth and config |
 | `~/.gitconfig`, `~/.config/git` | read-only | Git user config (name, email, aliases) |
+| `~/.ssh` | read-only | SSH keys for git operations |
 | `/etc/ssl/certs`, `/etc/hosts` | read-only | Provided by FHS rootfs |
 | `/nix/store` | read-only | Package closures for sandboxed tools |
 
-Everything else (SSH keys, browser data, other home directories, `/etc/shadow`) is invisible.
+Everything else (browser data, other home directories, `/etc/shadow`) is invisible.
 
 ### What the agent can run
 
@@ -273,11 +274,12 @@ nix run .#security-test
 ```
 
 Tests cover:
-- **Host data isolation**: SSH keys, Documents, Downloads, bash_history, GPG keys, /etc/shadow
+- **Host data isolation**: Documents, Downloads, bash_history, GPG keys, /etc/shadow
 - **Tmpfs isolation**: writes to `~/` succeed but are ephemeral
 - **Project directory**: `$PWD` is readable and writable
 - **Agent config dirs**: `~/.claude`, `~/.gemini`, `~/.codex` accessible
 - **Git config**: `~/.gitconfig` readable but not writable
+- **SSH keys**: `~/.ssh` readable but not writable
 - **Networking**: SSL certs, DNS resolution, HTTPS connectivity
 - **Nix store**: readable but not writable
 

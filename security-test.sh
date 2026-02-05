@@ -60,8 +60,6 @@ echo ""
 # ── Host data isolation ──────────────────────────────────
 
 echo "[Host Data Isolation -- real files must be invisible]"
-run_test "SSH private key (~/.ssh/id_rsa)"           blocked "cat ~/.ssh/id_rsa"
-run_test "SSH private key (~/.ssh/id_ed25519)"       blocked "cat ~/.ssh/id_ed25519"
 run_test "Home Documents (~/Documents)"              blocked "ls ~/Documents 2>/dev/null && test -n \"\$(ls ~/Documents)\""
 run_test "Home Downloads (~/Downloads)"              blocked "ls ~/Downloads 2>/dev/null && test -n \"\$(ls ~/Downloads)\""
 run_test "Bash history (~/.bash_history)"             blocked "cat ~/.bash_history"
@@ -106,6 +104,13 @@ run_test "Read ~/.gitconfig"                         info "cat \$HOME/.gitconfig
 run_test "Read ~/.config/git"                        info "ls \$HOME/.config/git 2>/dev/null || test ! -e \$HOME/.config/git"
 run_test "Git user.name accessible"                  info "git config --global user.name 2>/dev/null"
 run_test "Write to ~/.gitconfig blocked"             blocked "echo '[test]' >> \$HOME/.gitconfig"
+
+echo ""
+echo "[SSH Keys -- must be read-only]"
+run_test "Read ~/.ssh directory"                     info "ls \$HOME/.ssh 2>/dev/null || test ! -e \$HOME/.ssh"
+run_test "Read SSH private key"                      info "cat \$HOME/.ssh/id_ed25519 2>/dev/null || cat \$HOME/.ssh/id_rsa 2>/dev/null || test ! -e \$HOME/.ssh"
+run_test "SSH agent forwarding"                      info "test -n \"\$SSH_AUTH_SOCK\" && ssh-add -l 2>/dev/null"
+run_test "Write to ~/.ssh blocked"                   blocked "touch \$HOME/.ssh/.sandbox-test"
 
 echo ""
 echo "[Networking -- must work for API calls]"

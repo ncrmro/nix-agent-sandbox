@@ -37,6 +37,7 @@
           read = pkgs.lib.mkForce ([
             "$HOME/.gitconfig"            # git user config (name, email, aliases)
             "$HOME/.config/git"           # git XDG config directory
+            "$HOME/.ssh"                  # SSH keys for git operations
           ]
             ++ extraReadPaths
             ++ pkgs.lib.optional (githubTokenPath != null) githubTokenPath
