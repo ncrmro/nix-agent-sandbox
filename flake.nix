@@ -125,6 +125,7 @@
         curl
         gh
         nodejs_22
+        openssh
       ];
     in {
 
