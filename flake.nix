@@ -22,13 +22,17 @@
         ];
       };
 
+      # Default GitHub token path (agenix convention on NixOS).
+      # Override per-agent via the githubTokenPath parameter.
+      defaultGithubTokenPath = "/run/agenix/github-agents-token";
+
       # ── Shared sandbox config ──────────────────────────────────
       # Headless CLI defaults: no desktop, no audio, no display.
       # Agent-agnostic — works for any CLI tool.
       mkCliSandboxConfig = pkgs: {
         extraReadPaths ? [],
         extraReadWritePaths ? [],
-        githubTokenPath ? null,
+        githubTokenPath ? defaultGithubTokenPath,
       }: {
         mounts = {
           # Override desktop-oriented defaults (fonts, icons, themes).
@@ -85,12 +89,26 @@
         script.preCmds.stage3 = ''
           _RESOLV_CONF_REAL=$(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)
           etc_ignored+=("/etc/resolv.conf")
+        ''
+        + pkgs.lib.optionalString (githubTokenPath != null) ''
+          # Read GitHub token at runtime (before bwrap clears the env).
+          # Passed into the sandbox via --setenv in additionalArgs below.
+          _GH_TOKEN=""
+          if [ -r "${githubTokenPath}" ]; then
+            _GH_TOKEN=$(cat "${githubTokenPath}")
+          fi
         '';
         fhsenv.bwrap.additionalArgs = [
           ''--ro-bind "$_RESOLV_CONF_REAL" /etc/resolv.conf''
           # ~/.claude.json is a file, not a directory — bind-try avoids
           # mkdir errors from the FHS wrapper's readWrite mount handler.
           ''--bind-try "$HOME/.claude.json" "$HOME/.claude.json"''
+        ]
+        # Inject GH_TOKEN/GITHUB_TOKEN into the sandbox via --setenv
+        # (bwrap uses --clearenv, so host env vars don't survive).
+        ++ pkgs.lib.optionals (githubTokenPath != null) [
+          ''--setenv GH_TOKEN "$_GH_TOKEN"''
+          ''--setenv GITHUB_TOKEN "$_GH_TOKEN"''
         ];
       };
 
@@ -121,7 +139,7 @@
         env ? {},
         extraReadPaths ? [],
         extraReadWritePaths ? [],
-        githubTokenPath ? null,
+        githubTokenPath ? defaultGithubTokenPath,
       }:
         let
           sandboxConfig = mkCliSandboxConfig pkgs {
