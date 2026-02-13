@@ -53,6 +53,8 @@
             "$HOME/.config/git"             # git XDG config (needs write for credential helpers)
             "$HOME/.gemini"                 # gemini auth + config
             "$HOME/.codex"                  # codex auth + config
+            "$HOME/.local/share/pnpm/store" # pnpm content-addressable store
+            "$HOME/.npm"                    # npm cache
           ] ++ extraReadWritePaths);
 
           sandbox = pkgs.lib.mkForce [];
@@ -97,12 +99,43 @@
           if [ -r "${githubTokenPath}" ]; then
             _GH_TOKEN=$(cat "${githubTokenPath}")
           fi
+        ''
+        + ''
+          # ── Git worktree support ──────────────────────────────────
+          # In a worktree, $PWD/.git is a file pointing to the parent
+          # repo's .git/worktrees/<name>/ directory. Detect this and
+          # expose the parent .git/ so git operations work inside bwrap.
+          _GIT_PARENT_DIR=""
+          if [ -f "$PWD/.git" ]; then
+            _gitdir_line=$(head -1 "$PWD/.git")
+            _gitdir_path="''${_gitdir_line#gitdir: }"
+            if [ "$_gitdir_path" != "$_gitdir_line" ] && [ -n "$_gitdir_path" ]; then
+              # Handle relative gitdir paths
+              if [ "''${_gitdir_path#/}" = "$_gitdir_path" ]; then
+                _gitdir_path="$(cd "$PWD" && cd "$_gitdir_path" && pwd)"
+              fi
+              # Resolve parent .git/ via commondir (canonical) or fallback
+              if [ -f "$_gitdir_path/commondir" ]; then
+                _commondir=$(cat "$_gitdir_path/commondir")
+                _GIT_PARENT_DIR="$(cd "$_gitdir_path" && cd "$_commondir" && pwd)"
+              else
+                _GIT_PARENT_DIR="$(cd "$_gitdir_path/../.." && pwd)"
+              fi
+              # Security: verify it looks like a .git directory
+              if [ ! -f "$_GIT_PARENT_DIR/HEAD" ] || [ ! -d "$_GIT_PARENT_DIR/objects" ]; then
+                _GIT_PARENT_DIR=""
+              fi
+            fi
+          fi
         '';
         fhsenv.bwrap.additionalArgs = [
           ''--ro-bind "$_RESOLV_CONF_REAL" /etc/resolv.conf''
           # ~/.claude.json is a file, not a directory — bind-try avoids
           # mkdir errors from the FHS wrapper's readWrite mount handler.
           ''--bind-try "$HOME/.claude.json" "$HOME/.claude.json"''
+          # Git worktree: mount parent .git/ directory (read-write for commits).
+          # --bind-try is a no-op when _GIT_PARENT_DIR is empty (non-worktree case).
+          ''--bind-try "$_GIT_PARENT_DIR" "$_GIT_PARENT_DIR"''
         ]
         # Inject GH_TOKEN/GITHUB_TOKEN into the sandbox via --setenv
         # (bwrap uses --clearenv, so host env vars don't survive).
