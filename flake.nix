@@ -39,6 +39,7 @@
           # /etc/ssl/certs, /etc/resolv.conf, /etc/hosts are provided
           # by the FHS rootfs via /.host-etc symlinks.
           read = pkgs.lib.mkForce ([
+            "/nix/store"                  # Nix store (for symlink resolution, e.g. Home Manager configs)
             "$HOME/.gitconfig"            # git user config (name, email, aliases)
             "$HOME/.ssh"                  # SSH keys for git operations
           ]
