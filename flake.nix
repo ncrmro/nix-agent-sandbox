@@ -130,6 +130,9 @@
           fi
         '';
         fhsenv.bwrap.additionalArgs = [
+          # Use --dev to create proper /dev with device nodes (overrides earlier --dev-bind)
+          # Fixes /dev/null permission denied errors in sandbox
+          ''--dev /dev''
           ''--ro-bind "$_RESOLV_CONF_REAL" /etc/resolv.conf''
           # ~/.claude.json is a file, not a directory — bind-try avoids
           # mkdir errors from the FHS wrapper's readWrite mount handler.
