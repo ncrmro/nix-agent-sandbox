@@ -3,11 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nix-bwrapper.url = "github:Naxdy/nix-bwrapper";
     llm-agents.url = "github:numtide/llm-agents.nix";
   };
 
-  outputs = { self, nixpkgs, nix-bwrapper, llm-agents }:
+  outputs = { self, nixpkgs, llm-agents }:
     let
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs supportedSystems f;
@@ -16,7 +15,6 @@
         inherit system;
         config.allowUnfree = true;
         overlays = [
-          nix-bwrapper.overlays.default
           llm-agents.overlays.default
           self.overlays.default
         ];
@@ -25,129 +23,6 @@
       # Default GitHub token path (agenix convention on NixOS).
       # Override per-agent via the githubTokenPath parameter.
       defaultGithubTokenPath = "/run/agenix/github-agents-token";
-
-      # ── Shared sandbox config ──────────────────────────────────
-      # Headless CLI defaults: no desktop, no audio, no display.
-      # Agent-agnostic — works for any CLI tool.
-      mkCliSandboxConfig = pkgs: {
-        extraReadPaths ? [],
-        extraReadWritePaths ? [],
-        githubTokenPath ? defaultGithubTokenPath,
-      }: {
-        mounts = {
-          # Override desktop-oriented defaults (fonts, icons, themes).
-          # /etc/ssl/certs, /etc/resolv.conf, /etc/hosts are provided
-          # by the FHS rootfs via /.host-etc symlinks.
-          read = pkgs.lib.mkForce ([
-            "/nix/store"                  # Nix store (for symlink resolution, e.g. Home Manager configs)
-            "$HOME/.gitconfig"            # git user config (name, email, aliases)
-            "$HOME/.ssh"                  # SSH keys for git operations
-          ]
-            ++ extraReadPaths
-            ++ pkgs.lib.optional (githubTokenPath != null) githubTokenPath
-          );
-
-          readWrite = pkgs.lib.mkForce ([
-            "$PWD"                          # current project directory
-            "$HOME/.claude"                 # claude auth + config
-            "$HOME/.config/claude-code"     # claude additional config
-            "$HOME/.config/git"             # git XDG config (needs write for credential helpers)
-            "$HOME/.gemini"                 # gemini auth + config
-            "$HOME/.codex"                  # codex auth + config
-            "$HOME/.local/share/pnpm/store" # pnpm content-addressable store
-            "$HOME/.npm"                    # npm cache
-          ] ++ extraReadWritePaths);
-
-          sandbox = pkgs.lib.mkForce [];
-        };
-
-        fhsenv.skipExtraInstallCmds = true;
-        # mkBwrapper names the output bin/<pname> (e.g. bin/claude-code)
-        # but agents often expect the short name (e.g. bin/claude).
-        # Create a symlink so both names work and nix run finds mainProgram.
-        fhsenv.extraInstallCmds = ''
-          for bin in $out/bin/*; do
-            name="$(basename "$bin")"
-            # If pname has a hyphenated suffix, symlink the short form
-            short="''${name%%-*}"
-            if [ "$short" != "$name" ] && [ ! -e "$out/bin/$short" ]; then
-              ln -s "$bin" "$out/bin/$short"
-            fi
-          done
-        '';
-
-        sockets = {
-          x11 = false;
-          wayland = false;
-          pulseaudio = false;
-          pipewire = false;
-          cups = false;
-        };
-
-        # ── NixOS DNS fix ─────────────────────────────────────
-        # NixOS manages /etc/resolv.conf as a symlink chain that breaks
-        # inside bwrap's --tmpfs /etc. Fix: resolve on the host side and
-        # bind-mount the real file directly, skipping the FHS wrapper's
-        # broken symlink.
-        script.preCmds.stage3 = ''
-          _RESOLV_CONF_REAL=$(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)
-          etc_ignored+=("/etc/resolv.conf")
-        ''
-        + pkgs.lib.optionalString (githubTokenPath != null) ''
-          # Read GitHub token at runtime (before bwrap clears the env).
-          # Passed into the sandbox via --setenv in additionalArgs below.
-          _GH_TOKEN=""
-          if [ -r "${githubTokenPath}" ]; then
-            _GH_TOKEN=$(cat "${githubTokenPath}")
-          fi
-        ''
-        + ''
-          # ── Git worktree support ──────────────────────────────────
-          # In a worktree, $PWD/.git is a file pointing to the parent
-          # repo's .git/worktrees/<name>/ directory. Detect this and
-          # expose the parent .git/ so git operations work inside bwrap.
-          _GIT_PARENT_DIR=""
-          if [ -f "$PWD/.git" ]; then
-            _gitdir_line=$(head -1 "$PWD/.git")
-            _gitdir_path="''${_gitdir_line#gitdir: }"
-            if [ "$_gitdir_path" != "$_gitdir_line" ] && [ -n "$_gitdir_path" ]; then
-              # Handle relative gitdir paths
-              if [ "''${_gitdir_path#/}" = "$_gitdir_path" ]; then
-                _gitdir_path="$(cd "$PWD" && cd "$_gitdir_path" && pwd)"
-              fi
-              # Resolve parent .git/ via commondir (canonical) or fallback
-              if [ -f "$_gitdir_path/commondir" ]; then
-                _commondir=$(cat "$_gitdir_path/commondir")
-                _GIT_PARENT_DIR="$(cd "$_gitdir_path" && cd "$_commondir" && pwd)"
-              else
-                _GIT_PARENT_DIR="$(cd "$_gitdir_path/../.." && pwd)"
-              fi
-              # Security: verify it looks like a .git directory
-              if [ ! -f "$_GIT_PARENT_DIR/HEAD" ] || [ ! -d "$_GIT_PARENT_DIR/objects" ]; then
-                _GIT_PARENT_DIR=""
-              fi
-            fi
-          fi
-        '';
-        fhsenv.bwrap.additionalArgs = [
-          # Use --dev to create proper /dev with device nodes (overrides earlier --dev-bind)
-          # Fixes /dev/null permission denied errors in sandbox
-          ''--dev /dev''
-          ''--ro-bind "$_RESOLV_CONF_REAL" /etc/resolv.conf''
-          # ~/.claude.json is a file, not a directory — bind-try avoids
-          # mkdir errors from the FHS wrapper's readWrite mount handler.
-          ''--bind-try "$HOME/.claude.json" "$HOME/.claude.json"''
-          # Git worktree: mount parent .git/ directory (read-write for commits).
-          # --bind-try is a no-op when _GIT_PARENT_DIR is empty (non-worktree case).
-          ''--bind-try "$_GIT_PARENT_DIR" "$_GIT_PARENT_DIR"''
-        ]
-        # Inject GH_TOKEN/GITHUB_TOKEN into the sandbox via --setenv
-        # (bwrap uses --clearenv, so host env vars don't survive).
-        ++ pkgs.lib.optionals (githubTokenPath != null) [
-          ''--setenv GH_TOKEN "$_GH_TOKEN"''
-          ''--setenv GITHUB_TOKEN "$_GH_TOKEN"''
-        ];
-      };
 
       # ── Default toolchain for agents ──────────────────────────
       defaultAddPkgs = pkgs: with pkgs; [
@@ -164,12 +39,11 @@
         nodejs_22
         openssh
       ];
-    in {
 
-      # ── Library function ──────────────────────────────────────
-      # Wrap any package in the agent sandbox. Use this to sandbox
-      # agents that aren't pre-packaged below.
-      lib.mkAgentSandbox = {
+      # ── Direct bubblewrap wrapper ─────────────────────────────
+      # Minimal sandbox without FHS environment or ldconfig.
+      # Much simpler than nix-bwrapper - just what CLI agents need.
+      mkAgentWrapper = {
         pkgs,
         package,
         runScript,
@@ -180,34 +54,194 @@
         githubTokenPath ? defaultGithubTokenPath,
       }:
         let
-          sandboxConfig = mkCliSandboxConfig pkgs {
-            inherit extraReadPaths extraReadWritePaths githubTokenPath;
+          # Build PATH from addPkgs binaries
+          pathEntries = map (p: "${p}/bin") addPkgs;
+          pathString = pkgs.lib.concatStringsSep ":" pathEntries;
+
+          # The main package binary path
+          mainBin = "${package}/bin";
+
+          # Short name for symlink (e.g., "claude-code" -> "claude")
+          shortName = builtins.head (pkgs.lib.splitString "-" package.pname);
+
+          wrapperScript = pkgs.writeShellScript "agent-sandbox" ''
+            set -euo pipefail
+
+            # ── Resolve symlinks for NixOS ──────────────────────────
+            # NixOS uses symlinks for /etc/resolv.conf that break inside bwrap
+            _RESOLV=$(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)
+
+            # ── GitHub token ────────────────────────────────────────
+            _GH_TOKEN=""
+            ${pkgs.lib.optionalString (githubTokenPath != null) ''
+              if [ -r "${githubTokenPath}" ]; then
+                _GH_TOKEN=$(cat "${githubTokenPath}")
+              fi
+            ''}
+
+            # ── Git worktree support ────────────────────────────────
+            # In a worktree, $PWD/.git is a file pointing to the parent
+            # repo's .git/worktrees/<name>/ directory. Detect this and
+            # expose the parent .git/ so git operations work inside bwrap.
+            _GIT_PARENT_ARGS=""
+            if [ -f "$PWD/.git" ]; then
+              _gitdir_line=$(head -1 "$PWD/.git")
+              _gitdir_path="''${_gitdir_line#gitdir: }"
+              if [ "$_gitdir_path" != "$_gitdir_line" ] && [ -n "$_gitdir_path" ]; then
+                # Handle relative gitdir paths
+                if [ "''${_gitdir_path#/}" = "$_gitdir_path" ]; then
+                  _gitdir_path="$(cd "$PWD" && cd "$_gitdir_path" && pwd)"
+                fi
+                # Resolve parent .git/ via commondir (canonical) or fallback
+                _GIT_PARENT_DIR=""
+                if [ -f "$_gitdir_path/commondir" ]; then
+                  _commondir=$(cat "$_gitdir_path/commondir")
+                  _GIT_PARENT_DIR="$(cd "$_gitdir_path" && cd "$_commondir" && pwd)"
+                else
+                  _GIT_PARENT_DIR="$(cd "$_gitdir_path/../.." && pwd)"
+                fi
+                # Security: verify it looks like a .git directory
+                if [ -f "$_GIT_PARENT_DIR/HEAD" ] && [ -d "$_GIT_PARENT_DIR/objects" ]; then
+                  _GIT_PARENT_ARGS="--bind $_GIT_PARENT_DIR $_GIT_PARENT_DIR"
+                fi
+              fi
+            fi
+
+            # ── Build optional bind mounts ──────────────────────────
+            _OPTIONAL_BINDS=""
+
+            # ~/.claude.json (file, not directory)
+            if [ -f "$HOME/.claude.json" ]; then
+              _OPTIONAL_BINDS="$_OPTIONAL_BINDS --bind $HOME/.claude.json $HOME/.claude.json"
+            fi
+
+            # Extra read paths
+            ${pkgs.lib.concatMapStringsSep "\n" (path: ''
+              _expanded="${path}"
+              _expanded="''${_expanded//\$HOME/$HOME}"
+              _expanded="''${_expanded//\$PWD/$PWD}"
+              if [ -e "$_expanded" ]; then
+                _OPTIONAL_BINDS="$_OPTIONAL_BINDS --ro-bind $_expanded $_expanded"
+              fi
+            '') extraReadPaths}
+
+            # Extra read-write paths
+            ${pkgs.lib.concatMapStringsSep "\n" (path: ''
+              _expanded="${path}"
+              _expanded="''${_expanded//\$HOME/$HOME}"
+              _expanded="''${_expanded//\$PWD/$PWD}"
+              if [ -e "$_expanded" ]; then
+                _OPTIONAL_BINDS="$_OPTIONAL_BINDS --bind $_expanded $_expanded"
+              fi
+            '') extraReadWritePaths}
+
+            # Standard optional paths (create binds only if they exist)
+            for _path in \
+              "$HOME/.claude" \
+              "$HOME/.config/claude-code" \
+              "$HOME/.config/git" \
+              "$HOME/.gemini" \
+              "$HOME/.codex" \
+              "$HOME/.npm" \
+              "$HOME/.local/share/pnpm/store"
+            do
+              if [ -e "$_path" ]; then
+                _OPTIONAL_BINDS="$_OPTIONAL_BINDS --bind $_path $_path"
+              fi
+            done
+
+            # SSH and gitconfig (read-only)
+            for _path in "$HOME/.ssh" "$HOME/.gitconfig"; do
+              if [ -e "$_path" ]; then
+                _OPTIONAL_BINDS="$_OPTIONAL_BINDS --ro-bind $_path $_path"
+              fi
+            done
+
+            # SSL certificates (read-only, try common locations)
+            for _path in /etc/ssl /etc/pki/tls; do
+              if [ -d "$_path" ]; then
+                _OPTIONAL_BINDS="$_OPTIONAL_BINDS --ro-bind $_path $_path"
+              fi
+            done
+
+            # ── GitHub token env vars ───────────────────────────────
+            _GH_ENV_ARGS=""
+            ${pkgs.lib.optionalString (githubTokenPath != null) ''
+              if [ -n "$_GH_TOKEN" ]; then
+                _GH_ENV_ARGS="--setenv GH_TOKEN $_GH_TOKEN --setenv GITHUB_TOKEN $_GH_TOKEN"
+              fi
+            ''}
+
+            # ── Custom environment variables ────────────────────────
+            _CUSTOM_ENV_ARGS=""
+            ${pkgs.lib.concatStringsSep "\n" (
+              pkgs.lib.mapAttrsToList (name: value: ''
+                _CUSTOM_ENV_ARGS="$_CUSTOM_ENV_ARGS --setenv ${name} ${toString value}"
+              '') env
+            )}
+
+            # ── Execute in sandbox ──────────────────────────────────
+            exec ${pkgs.bubblewrap}/bin/bwrap \
+              --dev /dev \
+              --proc /proc \
+              --tmpfs /tmp \
+              --tmpfs "$HOME" \
+              --ro-bind /nix/store /nix/store \
+              --ro-bind "$_RESOLV" /etc/resolv.conf \
+              --ro-bind /etc/passwd /etc/passwd \
+              --ro-bind /etc/group /etc/group \
+              --ro-bind /etc/hosts /etc/hosts \
+              --bind "$PWD" "$PWD" \
+              $_GIT_PARENT_ARGS \
+              $_OPTIONAL_BINDS \
+              --chdir "$PWD" \
+              --die-with-parent \
+              --unshare-pid \
+              --setenv PATH "${mainBin}:${pathString}" \
+              --setenv HOME "$HOME" \
+              --setenv TERM "''${TERM:-xterm-256color}" \
+              $_GH_ENV_ARGS \
+              $_CUSTOM_ENV_ARGS \
+              ${runScript} "$@"
+          '';
+        in pkgs.runCommand "${package.pname}-sandbox" {
+          meta = package.meta or {} // {
+            mainProgram = package.pname;
           };
-        in pkgs.mkBwrapper (sandboxConfig // {
-          app = {
-            inherit package runScript addPkgs env;
-          };
-        });
+        } ''
+          mkdir -p $out/bin
+          ln -s ${wrapperScript} $out/bin/${package.pname}
+          ${pkgs.lib.optionalString (shortName != package.pname) ''
+            ln -s ${wrapperScript} $out/bin/${shortName}
+          ''}
+        '';
+
+    in {
+
+      # ── Library function ──────────────────────────────────────
+      # Wrap any package in the agent sandbox. Use this to sandbox
+      # agents that aren't pre-packaged below.
+      lib.mkAgentSandbox = mkAgentWrapper;
 
       # ── Overlay ───────────────────────────────────────────────
       # Adds sandboxed agent packages to pkgs.
       # Each agent runs in yolo mode since the sandbox provides OS-level isolation.
       overlays.default = final: prev: {
-        claude-code-sandbox = self.lib.mkAgentSandbox {
+        claude-code-sandbox = mkAgentWrapper {
           pkgs = final;
           package = final.llm-agents.claude-code;
           runScript = "claude --dangerously-skip-permissions";
           addPkgs = defaultAddPkgs final;
         };
 
-        gemini-cli-sandbox = self.lib.mkAgentSandbox {
+        gemini-cli-sandbox = mkAgentWrapper {
           pkgs = final;
           package = final.llm-agents.gemini-cli;
           runScript = "gemini --yolo";
           addPkgs = defaultAddPkgs final;
         };
 
-        codex-sandbox = self.lib.mkAgentSandbox {
+        codex-sandbox = mkAgentWrapper {
           pkgs = final;
           package = final.llm-agents.codex;
           runScript = "codex --yolo";
@@ -249,14 +283,12 @@
               version = "0.1.0";
               meta = testScript.meta or {} // { mainProgram = "security-test"; };
             };
-            sandboxConfig = mkCliSandboxConfig pkgs {};
-          in pkgs.mkBwrapper (sandboxConfig // {
-            app = {
-              package = testPkg;
-              runScript = "security-test";
-              addPkgs = with pkgs; [ coreutils bash curl gh git ];
-            };
-          });
+          in mkAgentWrapper {
+            pkgs = pkgs;
+            package = testPkg;
+            runScript = "security-test";
+            addPkgs = with pkgs; [ coreutils bash curl gh git openssh ];
+          };
         }
       );
 
