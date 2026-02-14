@@ -155,12 +155,25 @@
               fi
             done
 
-            # SSH and gitconfig (read-only)
-            for _path in "$HOME/.ssh" "$HOME/.gitconfig"; do
-              if [ -e "$_path" ]; then
-                _OPTIONAL_BINDS="$_OPTIONAL_BINDS --ro-bind $_path $_path"
+            # SSH directory (read-only)
+            # If ~/.ssh/config is a symlink (Home Manager), SSH rejects it due to
+            # "bad permissions" (sees lrwxrwxrwx). Set GIT_SSH_COMMAND to use the
+            # resolved config path directly.
+            _GIT_SSH_COMMAND=""
+            if [ -d "$HOME/.ssh" ]; then
+              _OPTIONAL_BINDS="$_OPTIONAL_BINDS --ro-bind $HOME/.ssh $HOME/.ssh"
+              if [ -L "$HOME/.ssh/config" ]; then
+                _ssh_config_resolved=$(readlink -f "$HOME/.ssh/config")
+                if [ -f "$_ssh_config_resolved" ]; then
+                  _GIT_SSH_COMMAND="ssh -F $_ssh_config_resolved"
+                fi
               fi
-            done
+            fi
+
+            # gitconfig (read-only)
+            if [ -e "$HOME/.gitconfig" ]; then
+              _OPTIONAL_BINDS="$_OPTIONAL_BINDS --ro-bind $HOME/.gitconfig $HOME/.gitconfig"
+            fi
 
             # SSL certificates (read-only, try common locations)
             for _path in /etc/ssl /etc/pki/tls; do
@@ -208,6 +221,7 @@
               --setenv SSL_CERT_FILE "$_SSL_CERT_FILE" \
               --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
               $_GH_ENV_ARGS \
+              ''${_GIT_SSH_COMMAND:+--setenv GIT_SSH_COMMAND "$_GIT_SSH_COMMAND"} \
               $_CUSTOM_ENV_ARGS \
               ${runScript} "$@"
           '';
