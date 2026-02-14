@@ -71,6 +71,11 @@
             # NixOS uses symlinks for /etc/resolv.conf that break inside bwrap
             _RESOLV=$(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)
 
+            # NixOS SSL certs are symlinks through /etc/static to /nix/store
+            # Resolve to the actual Nix store path so they work inside the sandbox
+            _SSL_CERT_FILE=$(readlink -f /etc/ssl/certs/ca-certificates.crt 2>/dev/null || echo /etc/ssl/certs/ca-certificates.crt)
+            _SSL_CERT_DIR=$(dirname "$_SSL_CERT_FILE")
+
             # ── GitHub token ────────────────────────────────────────
             _GH_TOKEN=""
             ${pkgs.lib.optionalString (githubTokenPath != null) ''
@@ -200,6 +205,8 @@
               --setenv PATH "${mainBin}:${pathString}" \
               --setenv HOME "$HOME" \
               --setenv TERM "''${TERM:-xterm-256color}" \
+              --setenv SSL_CERT_FILE "$_SSL_CERT_FILE" \
+              --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
               $_GH_ENV_ARGS \
               $_CUSTOM_ENV_ARGS \
               ${runScript} "$@"
