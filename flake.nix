@@ -211,6 +211,7 @@
               --tmpfs /tmp \
               --tmpfs "$HOME" \
               --ro-bind /nix/store /nix/store \
+              --symlink ${pkgs.coreutils}/bin/env /usr/bin/env \
               --ro-bind "$_RESOLV" /etc/resolv.conf \
               --ro-bind /etc/passwd /etc/passwd \
               --ro-bind /etc/group /etc/group \
