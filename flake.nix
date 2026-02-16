@@ -72,8 +72,14 @@
             _RESOLV=$(readlink -f /etc/resolv.conf 2>/dev/null || echo /etc/resolv.conf)
 
             # NixOS SSL certs are symlinks through /etc/static to /nix/store
-            # Resolve to the actual Nix store path so they work inside the sandbox
-            _SSL_CERT_FILE=$(readlink -f /etc/ssl/certs/ca-certificates.crt 2>/dev/null || echo /etc/ssl/certs/ca-certificates.crt)
+            # Resolve to the actual Nix store path so they work inside the sandbox.
+            # In nested sandboxes, the symlink may be dangling but SSL_CERT_FILE
+            # is already set correctly by the outer sandbox — prefer it if valid.
+            if [ -n "${SSL_CERT_FILE:-}" ] && [ -r "$SSL_CERT_FILE" ]; then
+              _SSL_CERT_FILE="$SSL_CERT_FILE"
+            else
+              _SSL_CERT_FILE=$(readlink -f /etc/ssl/certs/ca-certificates.crt 2>/dev/null || echo /etc/ssl/certs/ca-certificates.crt)
+            fi
             _SSL_CERT_DIR=$(dirname "$_SSL_CERT_FILE")
 
             # ── GitHub token ────────────────────────────────────────
