@@ -89,11 +89,11 @@
               mkdir -p "$PWD/.nix/var/nix/db" "$PWD/.nix/var/nix/gcroots/per-user" \
                        "$PWD/.nix/var/nix/profiles/per-user" "$PWD/.nix/var/nix/temproots" \
                        "$PWD/.nix/var/nix/userpool" "$PWD/.nix/var/nix/daemon-socket"
-              NIX_REMOTE=local NIX_STORE_DIR="$_tmpstore" NIX_STATE_DIR="$PWD/.nix/var" \
+              NIX_REMOTE=local NIX_STORE_DIR="$_tmpstore" NIX_STATE_DIR="$PWD/.nix/var/nix" \
                 ${pkgs.nix}/bin/nix-store --init 2>/dev/null || true
               rm -rf "$_tmpstore"
               # Register closure paths — the host /nix/store has all paths
-              NIX_REMOTE=local NIX_STATE_DIR="$PWD/.nix/var" \
+              NIX_REMOTE=local NIX_STATE_DIR="$PWD/.nix/var/nix" \
                 ${pkgs.nix}/bin/nix-store --load-db < ${closureInfo}/registration
             fi
 
