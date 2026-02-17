@@ -69,27 +69,6 @@
           # Closure registration for nix DB initialization inside sandbox
           closureInfo = pkgs.closureInfo { rootPaths = addPkgs ++ [ package ]; };
 
-          # Init script: runs as mapped root inside bwrap user namespace.
-          # DB is already initialized by the wrapper (on the host).
-          # Writes nix.conf and drops privileges before exec'ing the agent.
-          initScript = pkgs.writeShellScript "init-nix" ''
-            set -euo pipefail
-
-            # Write nix.conf for single-user mode.
-            mkdir -p /etc/nix
-            cat > /etc/nix/nix.conf << NIXCONF
-experimental-features = nix-command flakes
-sandbox = false
-NIXCONF
-
-            # Create .links dir on overlay (nix expects it for deduplication)
-            mkdir -p /nix/store/.links 2>/dev/null || true
-
-            # Drop root and exec the agent
-            exec ${pkgs.util-linux}/bin/unshare \
-              --user --map-user="$__SANDBOX_ORIG_UID" --map-group="$__SANDBOX_ORIG_GID" -- "$@"
-          '';
-
           wrapperScript = pkgs.writeShellScript "agent-sandbox" ''
             set -euo pipefail
 
@@ -362,16 +341,12 @@ NIXCONF
               '') env
             )}
 
-            # ── Capture original UID/GID for privilege drop ─────────
-            _ORIG_UID=$(id -u)
-            _ORIG_GID=$(id -g)
-
             # ── Execute in sandbox ──────────────────────────────────
             # bwrap's --overlay mounts overlayfs natively:
             #   - Host /nix/store as lower layer (read-only source)
             #   - $PWD/.nix/store as upper layer (persistent writes)
             #   - $PWD/.nix/work as overlayfs workdir
-            # init-nix initializes nix DB, drops privileges, execs agent.
+            # DB is pre-initialized on host. NIX_CONFIG provides nix settings.
             exec ${pkgs.bubblewrap}/bin/bwrap \
               --dev /dev \
               --proc /proc \
@@ -393,21 +368,19 @@ NIXCONF
               --chdir "$PWD" \
               --die-with-parent \
               --unshare-pid \
-              --unshare-user --uid 0 --gid 0 \
               --setenv PATH "${mainBin}:${pathString}" \
               --setenv HOME "$HOME" \
               --setenv TERM "''${TERM:-xterm-256color}" \
               --setenv SSL_CERT_FILE "$_SSL_CERT_FILE" \
               --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
-              --setenv NIX_CONFIG "experimental-features = nix-command flakes" \
+              --setenv NIX_CONFIG "experimental-features = nix-command flakes
+sandbox = false" \
               --setenv __NIX_AGENT_SANDBOXED 1 \
               --setenv __NIX_AGENT_SANDBOX_PWD "$PWD" \
-              --setenv __SANDBOX_ORIG_UID "$_ORIG_UID" \
-              --setenv __SANDBOX_ORIG_GID "$_ORIG_GID" \
               $_GH_ENV_ARGS \
               ''${_GIT_SSH_COMMAND:+--setenv GIT_SSH_COMMAND "$_GIT_SSH_COMMAND"} \
               $_CUSTOM_ENV_ARGS \
-              ${initScript} ${runScript} "$@"
+              ${runScript} "$@"
           '';
         in pkgs.runCommand "${package.pname}-sandbox" {
           meta = package.meta or {} // {
