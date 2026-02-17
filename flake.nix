@@ -101,9 +101,12 @@
             #
             if [ "''${__NIX_AGENT_SANDBOXED:-}" = "1" ]; then
               # Already inside a bwrap sandbox — cannot nest bwrap.
-              # Fall back to unshare --mount for lightweight namespace isolation.
+              # Fall back to unshare --user --mount for lightweight namespace isolation.
+              # --user is required because bwrap drops all capabilities (CapEff=0).
+              # --map-root-user maps our UID to root inside the user namespace so
+              # mount(8) syscalls are permitted.
               export PATH="${mainBin}:${pathString}:$PATH"
-              exec ${pkgs.util-linux}/bin/unshare --mount -- ${pkgs.bash}/bin/bash -c '
+              exec ${pkgs.util-linux}/bin/unshare --user --mount --map-root-user -- ${pkgs.bash}/bin/bash -c '
                 # ── Step 1: Privatize mount tree ──────────────────────
                 # By default, mount namespaces share propagation with the parent.
                 # Making everything rprivate ensures our tmpfs overlay and bind
@@ -116,6 +119,10 @@
                 # worktree inside the vault), we hide the outer PWD with tmpfs
                 # and then re-expose just our specific $PWD via bind mount.
                 #
+                # The inner $PWD content must be saved to a temp mount point
+                # BEFORE overlaying tmpfs on the outer PWD, because the inner
+                # path lives under the outer path and would be hidden otherwise.
+                #
                 # Example:
                 #   Outer PWD = /home/user/vault       (the vault root)
                 #   Inner PWD = /home/user/vault/.repos/owner/repo/.worktrees/feature
@@ -123,11 +130,15 @@
                 #           path is bind-mounted back and fully accessible.
                 _OUTER_PWD="''${__NIX_AGENT_SANDBOX_PWD:-}"
                 if [ -n "$_OUTER_PWD" ] && [ "$_OUTER_PWD" != "$PWD" ] && echo "$PWD" | grep -q "^$_OUTER_PWD/"; then
+                  # Save inner PWD to temp location before hiding outer
+                  _SAVE=/tmp/.inner-pwd-save
+                  mkdir -p "$_SAVE"
+                  ${pkgs.util-linux}/bin/mount --bind "$PWD" "$_SAVE"
                   # Overlay tmpfs hides the entire outer PWD tree
                   ${pkgs.util-linux}/bin/mount -t tmpfs tmpfs "$_OUTER_PWD"
-                  # Recreate the inner PWD path on the tmpfs and bind-mount it
+                  # Recreate the inner PWD path on the tmpfs and bind from saved
                   mkdir -p "$PWD"
-                  ${pkgs.util-linux}/bin/mount --bind "$PWD" "$PWD"
+                  ${pkgs.util-linux}/bin/mount --bind "$_SAVE" "$PWD"
                 fi
 
                 # ── Step 3: Execute the agent ─────────────────────────
