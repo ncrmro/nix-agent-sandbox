@@ -368,6 +368,7 @@ NIXCONF
               --chdir "$PWD" \
               --die-with-parent \
               --unshare-pid \
+              --unshare-user --uid 0 --gid 0 \
               --setenv PATH "${mainBin}:${pathString}" \
               --setenv HOME "$HOME" \
               --setenv TERM "''${TERM:-xterm-256color}" \

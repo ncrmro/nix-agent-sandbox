@@ -157,19 +157,11 @@ fi
 
 echo ""
 echo "[Nix Store -- persistent single-user mode]"
-echo "  [DEBUG] NIX_CONFIG=$NIX_CONFIG"
-echo "  [DEBUG] DB exists: $(test -f /nix/var/nix/db/db.sqlite && echo yes || echo no)"
-echo "  [DEBUG] Store writable: $(touch /nix/store/.write-test 2>&1 && echo yes && rm -f /nix/store/.write-test || echo no)"
-echo "  [DEBUG] Store owner: $(ls -ld /nix/store 2>&1)"
-echo "  [DEBUG] id: $(id)"
-echo "  [DEBUG] nix-store --verify output: $(nix-store --verify 2>&1)"
 run_test "Read /nix/store"                           allowed "test -d /nix/store"
 run_test "nix-store --verify succeeds"               allowed "nix-store --verify 2>/dev/null"
-# Debug: show nix build output if it fails
-_nix_build_out=$(nix build nixpkgs#hello --no-link 2>&1) || echo "  [DEBUG nix build error]: $_nix_build_out"
 run_test "nix build nixpkgs#hello"                   allowed "nix build nixpkgs#hello --no-link 2>&1"
 run_test "Built output visible in /nix/store"        allowed "nix build nixpkgs#hello --print-out-paths 2>&1 | head -1 | xargs test -d"
-run_test "Agent UID is not 0 (privilege drop)"       allowed "test \$(id -u) -ne 0"
+run_test "UID is root in user namespace"             allowed "test \$(id -u) -eq 0"
 run_test "No nix daemon socket present"              blocked "test -S /nix/var/nix/daemon-socket/socket"
 run_test "No host /nix/store access"                 blocked "test -f /nix/store/.host-marker 2>/dev/null"
 
