@@ -70,32 +70,10 @@
           closureInfo = pkgs.closureInfo { rootPaths = addPkgs ++ [ package ]; };
 
           # Init script: runs as mapped root inside bwrap user namespace.
-          # bwrap's --overlay mounts the overlayfs before this runs.
-          # Initializes nix DB on first run, then drops privileges and execs agent.
+          # DB is already initialized by the wrapper (on the host).
+          # Writes nix.conf and drops privileges before exec'ing the agent.
           initScript = pkgs.writeShellScript "init-nix" ''
             set -euo pipefail
-
-            # Initialize nix DB for single-user mode (first run only)
-            if [ ! -f /nix/var/nix/db/db.sqlite ]; then
-              mkdir -p /nix/var/nix/db /nix/var/nix/gcroots/per-user \
-                       /nix/var/nix/profiles/per-user /nix/var/nix/temproots \
-                       /nix/var/nix/userpool /nix/var/nix/daemon-socket
-
-              # nix-store --init tries to chown /nix/store which fails on
-              # overlayfs mount points (EINVAL in user namespaces). Workaround:
-              # temporarily mount tmpfs on /nix/store for --init (which only
-              # creates the DB schema in /nix/var), then unmount so the overlay
-              # comes back for --load-db (which needs to see the store paths).
-              ${pkgs.util-linux}/bin/mount -t tmpfs tmpfs /nix/store
-              ${pkgs.nix}/bin/nix-store --init
-              ${pkgs.util-linux}/bin/umount /nix/store
-
-              # Now overlay is visible again — register closure paths in DB
-              ${pkgs.nix}/bin/nix-store --load-db < /nix/.closure-registration
-
-              # Create .links dir on overlay (nix expects it for deduplication)
-              mkdir -p /nix/store/.links
-            fi
 
             # Write nix.conf for single-user mode.
             mkdir -p /etc/nix
@@ -103,6 +81,9 @@
 experimental-features = nix-command flakes
 sandbox = false
 NIXCONF
+
+            # Create .links dir on overlay (nix expects it for deduplication)
+            mkdir -p /nix/store/.links 2>/dev/null || true
 
             # Drop root and exec the agent
             exec ${pkgs.util-linux}/bin/unshare \
@@ -117,6 +98,25 @@ NIXCONF
             # .work is the overlayfs workdir (must be on same fs as upper).
             # Add .nix/ to your .gitignore.
             mkdir -p "$PWD/.nix/store" "$PWD/.nix/var" "$PWD/.nix/work"
+
+            # ── Initialize nix DB on host (first run only) ────────────
+            # Must happen BEFORE entering bwrap because nix-store --init
+            # tries to chown /nix/store which fails on overlayfs mount points.
+            # We use a temp store dir for --init (it creates the DB schema
+            # in the state dir) and the real /nix/store for --load-db
+            # (it registers closure paths that exist in the host store).
+            if [ ! -f "$PWD/.nix/var/nix/db/db.sqlite" ]; then
+              _tmpstore=$(mktemp -d)
+              mkdir -p "$PWD/.nix/var/nix/db" "$PWD/.nix/var/nix/gcroots/per-user" \
+                       "$PWD/.nix/var/nix/profiles/per-user" "$PWD/.nix/var/nix/temproots" \
+                       "$PWD/.nix/var/nix/userpool" "$PWD/.nix/var/nix/daemon-socket"
+              NIX_REMOTE=local NIX_STORE_DIR="$_tmpstore" NIX_STATE_DIR="$PWD/.nix/var" \
+                ${pkgs.nix}/bin/nix-store --init 2>/dev/null || true
+              rm -rf "$_tmpstore"
+              # Register closure paths — the host /nix/store has all paths
+              NIX_REMOTE=local NIX_STATE_DIR="$PWD/.nix/var" \
+                ${pkgs.nix}/bin/nix-store --load-db < ${closureInfo}/registration
+            fi
 
             # ── Nested sandbox detection ─────────────────────────────
             #
