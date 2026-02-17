@@ -38,6 +38,7 @@
         gh
         nodejs_22
         openssh
+        util-linux  # Provides unshare + mount for nested sandbox scoping
       ];
 
       # ── Direct bubblewrap wrapper ─────────────────────────────
@@ -66,6 +67,74 @@
 
           wrapperScript = pkgs.writeShellScript "agent-sandbox" ''
             set -euo pipefail
+
+            # ── Nested sandbox detection ─────────────────────────────
+            #
+            # Problem: bubblewrap (bwrap) cannot nest inside another bwrap sandbox.
+            # When bwrap runs pivot_root inside an outer bwrap namespace, it tries
+            # to resolve paths like /oldroot/etc/passwd which don't exist in the
+            # outer namespace's filesystem view. This is a known kernel-level
+            # limitation (bubblewrap issues #164, #273, #543) with no workaround.
+            #
+            # Detection: The outer sandbox sets __NIX_AGENT_SANDBOXED=1 (see the
+            # --setenv flags in the bwrap invocation below). If this variable is
+            # present, we know we're already inside a bwrap sandbox.
+            #
+            # Solution: Instead of bwrap, use `unshare --mount` which creates a
+            # new mount namespace from the current filesystem view WITHOUT
+            # pivot_root. This avoids the /oldroot path resolution problem entirely.
+            #
+            # Scoping: Even though we can't use bwrap's full isolation, we still
+            # want to restrict the inner agent to its own $PWD (e.g., a worktree)
+            # rather than giving it access to the entire outer sandbox's $PWD.
+            # We achieve this by:
+            #   1. Making all mounts private (no propagation to parent namespace)
+            #   2. Overlaying tmpfs on the outer sandbox's $PWD to hide it
+            #   3. Re-bind-mounting just the inner agent's $PWD on top
+            #
+            # The outer sandbox's $PWD is recorded in __NIX_AGENT_SANDBOX_PWD so
+            # we know what path to hide. Scoping only applies when the inner $PWD
+            # is a subdirectory of the outer $PWD (typical worktree layout).
+            #
+            # If __NIX_AGENT_SANDBOX_PWD is unset or $PWD is not a sub-path,
+            # we skip scoping and just exec the agent — safe default behavior.
+            #
+            if [ "''${__NIX_AGENT_SANDBOXED:-}" = "1" ]; then
+              # Already inside a bwrap sandbox — cannot nest bwrap.
+              # Fall back to unshare --mount for lightweight namespace isolation.
+              export PATH="${mainBin}:${pathString}:$PATH"
+              exec ${pkgs.util-linux}/bin/unshare --mount -- ${pkgs.bash}/bin/bash -c '
+                # ── Step 1: Privatize mount tree ──────────────────────
+                # By default, mount namespaces share propagation with the parent.
+                # Making everything rprivate ensures our tmpfs overlay and bind
+                # mounts are invisible to the outer sandbox.
+                ${pkgs.util-linux}/bin/mount --make-rprivate /
+
+                # ── Step 2: Scope inner agent to its own $PWD ─────────
+                # __NIX_AGENT_SANDBOX_PWD holds the outer sandbox PWD (e.g., the
+                # vault root). If our $PWD is a subdirectory of that (e.g., a
+                # worktree inside the vault), we hide the outer PWD with tmpfs
+                # and then re-expose just our specific $PWD via bind mount.
+                #
+                # Example:
+                #   Outer PWD = /home/user/vault       (the vault root)
+                #   Inner PWD = /home/user/vault/.repos/owner/repo/.worktrees/feature
+                #   Result: /home/user/vault is empty tmpfs, but the worktree
+                #           path is bind-mounted back and fully accessible.
+                _OUTER_PWD="''${__NIX_AGENT_SANDBOX_PWD:-}"
+                if [ -n "$_OUTER_PWD" ] && [ "$_OUTER_PWD" != "$PWD" ] && echo "$PWD" | grep -q "^$_OUTER_PWD/"; then
+                  # Overlay tmpfs hides the entire outer PWD tree
+                  ${pkgs.util-linux}/bin/mount -t tmpfs tmpfs "$_OUTER_PWD"
+                  # Recreate the inner PWD path on the tmpfs and bind-mount it
+                  mkdir -p "$PWD"
+                  ${pkgs.util-linux}/bin/mount --bind "$PWD" "$PWD"
+                fi
+
+                # ── Step 3: Execute the agent ─────────────────────────
+                cd "$PWD"
+                exec '"${runScript}"' "$@"
+              ' -- "$@"
+            fi
 
             # ── Resolve symlinks for NixOS ──────────────────────────
             # NixOS uses symlinks for /etc/resolv.conf that break inside bwrap
@@ -228,6 +297,8 @@
               --setenv TERM "''${TERM:-xterm-256color}" \
               --setenv SSL_CERT_FILE "$_SSL_CERT_FILE" \
               --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
+              --setenv __NIX_AGENT_SANDBOXED 1 \
+              --setenv __NIX_AGENT_SANDBOX_PWD "$PWD" \
               $_GH_ENV_ARGS \
               ''${_GIT_SSH_COMMAND:+--setenv GIT_SSH_COMMAND "$_GIT_SSH_COMMAND"} \
               $_CUSTOM_ENV_ARGS \
