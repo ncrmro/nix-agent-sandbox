@@ -69,43 +69,79 @@
           # Closure registration for nix DB initialization inside sandbox
           closureInfo = pkgs.closureInfo { rootPaths = addPkgs ++ [ package ]; };
 
-          # LD_PRELOAD shim: intercept lchown/chown on /nix/store (the overlay
-          # mount-point root) and return 0. Nix's LocalStore init chowns
-          # /nix/store when running as root, but overlayfs returns EINVAL for
-          # chown on its mount-point root (can't copy-up the root inode).
-          # This shim makes that single call a no-op. All other chown/lchown
-          # calls pass through to the real implementation.
+          # LD_PRELOAD shim for overlayfs in user namespaces.
+          #
+          # Two problems with overlayfs + user namespaces:
+          # 1. chown on the overlay mount-point root (/nix/store) returns
+          #    EINVAL — the root inode can't be copied up.
+          # 2. chmod/chown on paths copied up from the lower layer (host
+          #    store) returns EPERM — overlayfs's setattr_prepare checks
+          #    permissions with caller credentials BEFORE ovl_override_creds,
+          #    and user-namespace capabilities don't apply to the init ns.
+          #
+          # Fix: intercept chmod/chown/lchown. For /nix/store (exact), always
+          # return 0. For /nix/store/* paths, try the real call first; if it
+          # returns EPERM or EINVAL, return 0 (the lower-layer path already
+          # has correct permissions from the host nix store).
           overlayChownShim = pkgs.stdenv.mkDerivation {
-            name = "overlayfs-chown-shim";
+            name = "overlayfs-store-shim";
             dontUnpack = true;
             buildPhase = ''
               cat > shim.c << 'CSRC'
               #define _GNU_SOURCE
               #include <dlfcn.h>
+              #include <errno.h>
               #include <string.h>
+              #include <sys/stat.h>
               #include <sys/types.h>
               #include <unistd.h>
 
-              static int (*real_lchown)(const char *, uid_t, gid_t) = NULL;
-              static int (*real_chown)(const char *, uid_t, gid_t) = NULL;
+              /* Prefix for paths we intercept */
+              #define STORE "/nix/store"
+              #define STORE_LEN 10
 
-              int lchown(const char *path, uid_t owner, gid_t group) {
-                  if (!real_lchown) real_lchown = dlsym(RTLD_NEXT, "lchown");
-                  if (strcmp(path, "/nix/store") == 0) return 0;
-                  return real_lchown(path, owner, group);
+              static int is_store_path(const char *path) {
+                  return strncmp(path, STORE, STORE_LEN) == 0
+                      && (path[STORE_LEN] == '\0' || path[STORE_LEN] == '/');
               }
+
+              /* chown/lchown: no-op for /nix/store exact, retry-on-fail for sub-paths */
+              static int (*real_chown)(const char *, uid_t, gid_t) = NULL;
+              static int (*real_lchown)(const char *, uid_t, gid_t) = NULL;
+              static int (*real_chmod)(const char *, mode_t) = NULL;
 
               int chown(const char *path, uid_t owner, gid_t group) {
                   if (!real_chown) real_chown = dlsym(RTLD_NEXT, "chown");
-                  if (strcmp(path, "/nix/store") == 0) return 0;
-                  return real_chown(path, owner, group);
+                  if (!is_store_path(path)) return real_chown(path, owner, group);
+                  if (path[STORE_LEN] == '\0') return 0; /* mount root */
+                  int ret = real_chown(path, owner, group);
+                  if (ret == -1 && (errno == EPERM || errno == EINVAL)) return 0;
+                  return ret;
+              }
+
+              int lchown(const char *path, uid_t owner, gid_t group) {
+                  if (!real_lchown) real_lchown = dlsym(RTLD_NEXT, "lchown");
+                  if (!is_store_path(path)) return real_lchown(path, owner, group);
+                  if (path[STORE_LEN] == '\0') return 0; /* mount root */
+                  int ret = real_lchown(path, owner, group);
+                  if (ret == -1 && (errno == EPERM || errno == EINVAL)) return 0;
+                  return ret;
+              }
+
+              int chmod(const char *path, mode_t mode) {
+                  if (!real_chmod) real_chmod = dlsym(RTLD_NEXT, "chmod");
+                  if (!is_store_path(path)) return real_chmod(path, mode);
+                  if (path[STORE_LEN] == '\0') return 0; /* mount root */
+                  int ret = real_chmod(path, mode);
+                  if (ret == -1 && (errno == EPERM || errno == EINVAL)) return 0;
+                  return ret;
               }
               CSRC
-              $CC -shared -fPIC -o libovl-chown-shim.so shim.c -ldl
+              $CC -shared -fPIC -o libovl-store-shim.so shim.c -ldl
             '';
             installPhase = ''
               mkdir -p $out/lib
-              cp libovl-chown-shim.so $out/lib/
+              cp libovl-store-shim.so $out/lib/
             '';
           };
 
@@ -422,7 +458,7 @@ NIXCONF
               --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
               --setenv NIX_CONFIG "experimental-features = nix-command flakes
 sandbox = false" \
-              --setenv LD_PRELOAD "${overlayChownShim}/lib/libovl-chown-shim.so" \
+              --setenv LD_PRELOAD "${overlayChownShim}/lib/libovl-store-shim.so" \
               --setenv IS_SANDBOX 1 \
               --setenv __NIX_AGENT_SANDBOXED 1 \
               --setenv __NIX_AGENT_SANDBOX_PWD "$PWD" \
