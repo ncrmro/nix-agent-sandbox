@@ -157,6 +157,8 @@ fi
 
 echo ""
 echo "[Nix Store -- persistent single-user mode]"
+echo "  [DEBUG] LD_PRELOAD: ${LD_PRELOAD:-not set}"
+echo "  [DEBUG] shim file: $(ls ${LD_PRELOAD:-/nonexistent} 2>&1)"
 echo "  [DEBUG] id: $(id)"
 echo "  [DEBUG] DB: $(ls -la /nix/var/nix/db/db.sqlite 2>&1)"
 echo "  [DEBUG] store ls: $(ls -ld /nix/store 2>&1)"

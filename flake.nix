@@ -91,6 +91,7 @@
               #define _GNU_SOURCE
               #include <dlfcn.h>
               #include <errno.h>
+              #include <fcntl.h>
               #include <string.h>
               #include <sys/stat.h>
               #include <sys/types.h>
@@ -101,40 +102,61 @@
               #define STORE_LEN 10
 
               static int is_store_path(const char *path) {
+                  if (!path) return 0;
                   return strncmp(path, STORE, STORE_LEN) == 0
                       && (path[STORE_LEN] == '\0' || path[STORE_LEN] == '/');
               }
 
-              /* chown/lchown: no-op for /nix/store exact, retry-on-fail for sub-paths */
+              /* Silently succeed for EPERM/EINVAL on store paths.
+               * Lower-layer paths already have correct metadata from host nix. */
+              #define STORE_SHIM_CHECK(ret) \
+                  if (ret == -1 && (errno == EPERM || errno == EINVAL)) return 0; \
+                  return ret;
+
+              /* Path-based wrappers */
               static int (*real_chown)(const char *, uid_t, gid_t) = NULL;
               static int (*real_lchown)(const char *, uid_t, gid_t) = NULL;
               static int (*real_chmod)(const char *, mode_t) = NULL;
 
-              int chown(const char *path, uid_t owner, gid_t group) {
+              int chown(const char *path, uid_t o, gid_t g) {
                   if (!real_chown) real_chown = dlsym(RTLD_NEXT, "chown");
-                  if (!is_store_path(path)) return real_chown(path, owner, group);
-                  if (path[STORE_LEN] == '\0') return 0; /* mount root */
-                  int ret = real_chown(path, owner, group);
-                  if (ret == -1 && (errno == EPERM || errno == EINVAL)) return 0;
-                  return ret;
+                  if (!is_store_path(path)) return real_chown(path, o, g);
+                  if (path[STORE_LEN] == '\0') return 0;
+                  int r = real_chown(path, o, g); STORE_SHIM_CHECK(r);
               }
 
-              int lchown(const char *path, uid_t owner, gid_t group) {
+              int lchown(const char *path, uid_t o, gid_t g) {
                   if (!real_lchown) real_lchown = dlsym(RTLD_NEXT, "lchown");
-                  if (!is_store_path(path)) return real_lchown(path, owner, group);
-                  if (path[STORE_LEN] == '\0') return 0; /* mount root */
-                  int ret = real_lchown(path, owner, group);
-                  if (ret == -1 && (errno == EPERM || errno == EINVAL)) return 0;
-                  return ret;
+                  if (!is_store_path(path)) return real_lchown(path, o, g);
+                  if (path[STORE_LEN] == '\0') return 0;
+                  int r = real_lchown(path, o, g); STORE_SHIM_CHECK(r);
               }
 
-              int chmod(const char *path, mode_t mode) {
+              int chmod(const char *path, mode_t m) {
                   if (!real_chmod) real_chmod = dlsym(RTLD_NEXT, "chmod");
-                  if (!is_store_path(path)) return real_chmod(path, mode);
-                  if (path[STORE_LEN] == '\0') return 0; /* mount root */
-                  int ret = real_chmod(path, mode);
-                  if (ret == -1 && (errno == EPERM || errno == EINVAL)) return 0;
-                  return ret;
+                  if (!is_store_path(path)) return real_chmod(path, m);
+                  if (path[STORE_LEN] == '\0') return 0;
+                  int r = real_chmod(path, m); STORE_SHIM_CHECK(r);
+              }
+
+              /* *at variants — nix or glibc may use these internally */
+              static int (*real_fchmodat)(int, const char *, mode_t, int) = NULL;
+              static int (*real_fchownat)(int, const char *, uid_t, gid_t, int) = NULL;
+
+              int fchmodat(int dirfd, const char *path, mode_t m, int flags) {
+                  if (!real_fchmodat) real_fchmodat = dlsym(RTLD_NEXT, "fchmodat");
+                  if (dirfd != AT_FDCWD || !is_store_path(path))
+                      return real_fchmodat(dirfd, path, m, flags);
+                  if (path[STORE_LEN] == '\0') return 0;
+                  int r = real_fchmodat(dirfd, path, m, flags); STORE_SHIM_CHECK(r);
+              }
+
+              int fchownat(int dirfd, const char *path, uid_t o, gid_t g, int flags) {
+                  if (!real_fchownat) real_fchownat = dlsym(RTLD_NEXT, "fchownat");
+                  if (dirfd != AT_FDCWD || !is_store_path(path))
+                      return real_fchownat(dirfd, path, o, g, flags);
+                  if (path[STORE_LEN] == '\0') return 0;
+                  int r = real_fchownat(dirfd, path, o, g, flags); STORE_SHIM_CHECK(r);
               }
               CSRC
               $CC -shared -fPIC -o libovl-store-shim.so shim.c -ldl
