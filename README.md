@@ -85,17 +85,18 @@ Host OS
       work/                  # overlayfs workdir
       var/                   # nix database
 
-  +-- Outer Ring: bubblewrap (user namespace, --uid $UID --gid $GID)
+  +-- Outer Ring: bubblewrap (user namespace, --uid 0 --gid 0)
   |     Mount namespace: only $PWD + agent configs + certs
   |     /nix/store ← overlayfs (host store lower + .nix/store upper)
   |     /nix/var ← bind $PWD/.nix/var (persistent DB)
   |     PID namespace: isolated
   |     Network: allowed (API access)
-  |   +-- Agent runs as original UID (not root)
+  |   +-- Agent runs as uid 0 in user namespace (IS_SANDBOX=1)
+  |         LD_PRELOAD shim intercepts chown on overlay root
   |         Command filtering, network restrictions, file controls
 ```
 
-The outer ring prevents the process from seeing anything outside the mount list. bwrap's built-in `--overlay` mounts an overlayfs on `/nix/store` with the host nix store as the read-only lower layer and `$PWD/.nix/store` as the persistent upper layer. The agent runs as its original UID (not root) inside a user namespace — this avoids nix's root-only `chown /nix/store` call which returns EINVAL on overlayfs mount-point roots. The user namespace still grants all namespace capabilities (CAP_FOWNER, etc.) so nix can chmod/chown newly built store paths. New derivations are written to the upper layer and persist across sessions.
+The outer ring prevents the process from seeing anything outside the mount list. bwrap's built-in `--overlay` mounts an overlayfs on `/nix/store` with the host nix store as the read-only lower layer and `$PWD/.nix/store` as the persistent upper layer. The agent runs as uid 0 in a user namespace — this gives nix the CAP_FOWNER capability needed to chmod/chown store paths copied up from the overlay lower layer (host store paths are owned by real root, which maps to `nobody` in the namespace). An LD_PRELOAD shim intercepts the one `chown("/nix/store")` call that nix makes on startup, which would otherwise return EINVAL on the overlayfs mount-point root. New derivations are written to the upper layer and persist across sessions.
 
 A **persistent `.nix/` directory** in `$PWD` stores the overlay upper layer and nix database. On first run, the wrapper script initializes the nix DB and loads the agent's closure on the host (before entering bwrap). Subsequent runs are fast — no re-downloading.
 

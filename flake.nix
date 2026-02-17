@@ -69,6 +69,46 @@
           # Closure registration for nix DB initialization inside sandbox
           closureInfo = pkgs.closureInfo { rootPaths = addPkgs ++ [ package ]; };
 
+          # LD_PRELOAD shim: intercept lchown/chown on /nix/store (the overlay
+          # mount-point root) and return 0. Nix's LocalStore init chowns
+          # /nix/store when running as root, but overlayfs returns EINVAL for
+          # chown on its mount-point root (can't copy-up the root inode).
+          # This shim makes that single call a no-op. All other chown/lchown
+          # calls pass through to the real implementation.
+          overlayChownShim = pkgs.stdenv.mkDerivation {
+            name = "overlayfs-chown-shim";
+            dontUnpack = true;
+            buildPhase = ''
+              cat > shim.c << 'CSRC'
+              #define _GNU_SOURCE
+              #include <dlfcn.h>
+              #include <string.h>
+              #include <sys/types.h>
+              #include <unistd.h>
+
+              static int (*real_lchown)(const char *, uid_t, gid_t) = NULL;
+              static int (*real_chown)(const char *, uid_t, gid_t) = NULL;
+
+              int lchown(const char *path, uid_t owner, gid_t group) {
+                  if (!real_lchown) real_lchown = dlsym(RTLD_NEXT, "lchown");
+                  if (strcmp(path, "/nix/store") == 0) return 0;
+                  return real_lchown(path, owner, group);
+              }
+
+              int chown(const char *path, uid_t owner, gid_t group) {
+                  if (!real_chown) real_chown = dlsym(RTLD_NEXT, "chown");
+                  if (strcmp(path, "/nix/store") == 0) return 0;
+                  return real_chown(path, owner, group);
+              }
+              CSRC
+              $CC -shared -fPIC -o libovl-chown-shim.so shim.c -ldl
+            '';
+            installPhase = ''
+              mkdir -p $out/lib
+              cp libovl-chown-shim.so $out/lib/
+            '';
+          };
+
           wrapperScript = pkgs.writeShellScript "agent-sandbox" ''
             set -euo pipefail
 
@@ -347,14 +387,12 @@ NIXCONF
             #   - Host /nix/store as lower layer (read-only source)
             #   - $PWD/.nix/store as upper layer (persistent writes)
             #   - $PWD/.nix/work as overlayfs workdir
-            # The user namespace (--unshare-user) is required for unprivileged
-            # overlayfs. We map to the ORIGINAL uid/gid (not root) so that
-            # nix skips the "chown /nix/store" call in LocalStore init —
-            # that call returns EINVAL on overlayfs mount-point roots.
-            # The user namespace still grants all ns capabilities (CAP_FOWNER
-            # etc.) so nix can chmod/chown newly built store paths.
-            _UID=$(id -u)
-            _GID=$(id -g)
+            # Running as uid 0 in user namespace (--uid 0 --gid 0) is
+            # required because nix needs CAP_FOWNER for chmod/chown on
+            # store paths copied up from the overlay lower layer (host
+            # store paths owned by real root appear as nobody in the ns).
+            # The LD_PRELOAD shim intercepts lchown on /nix/store itself
+            # because overlayfs returns EINVAL for chown on its mount root.
             exec ${pkgs.bubblewrap}/bin/bwrap \
               --dev /dev \
               --proc /proc \
@@ -376,7 +414,7 @@ NIXCONF
               --chdir "$PWD" \
               --die-with-parent \
               --unshare-pid \
-              --unshare-user --uid "$_UID" --gid "$_GID" \
+              --unshare-user --uid 0 --gid 0 \
               --setenv PATH "${mainBin}:${pathString}" \
               --setenv HOME "$HOME" \
               --setenv TERM "''${TERM:-xterm-256color}" \
@@ -384,6 +422,8 @@ NIXCONF
               --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
               --setenv NIX_CONFIG "experimental-features = nix-command flakes
 sandbox = false" \
+              --setenv LD_PRELOAD "${overlayChownShim}/lib/libovl-chown-shim.so" \
+              --setenv IS_SANDBOX 1 \
               --setenv __NIX_AGENT_SANDBOXED 1 \
               --setenv __NIX_AGENT_SANDBOX_PWD "$PWD" \
               $_GH_ENV_ARGS \
