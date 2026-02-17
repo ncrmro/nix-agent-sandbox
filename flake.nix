@@ -376,6 +376,7 @@ NIXCONF
               --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
               --setenv NIX_CONFIG "experimental-features = nix-command flakes
 sandbox = false" \
+              --setenv IS_SANDBOX 1 \
               --setenv __NIX_AGENT_SANDBOXED 1 \
               --setenv __NIX_AGENT_SANDBOX_PWD "$PWD" \
               $_GH_ENV_ARGS \
