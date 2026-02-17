@@ -38,6 +38,7 @@
         gh
         nodejs_22
         openssh
+        nix         # Allows agents to launch sub-agents via nix run
         util-linux  # Provides unshare + mount for nested sandbox scoping
       ];
 
@@ -272,6 +273,12 @@
               fi
             done
 
+            # Nix daemon socket (read-only, for nix run/build inside sandbox)
+            _NIX_DAEMON_SOCKET="/nix/var/nix/daemon-socket/socket"
+            if [ -S "$_NIX_DAEMON_SOCKET" ]; then
+              _OPTIONAL_BINDS="$_OPTIONAL_BINDS --bind /nix/var/nix/daemon-socket /nix/var/nix/daemon-socket"
+            fi
+
             # ── GitHub token env vars ───────────────────────────────
             _GH_ENV_ARGS=""
             ${pkgs.lib.optionalString (githubTokenPath != null) ''
@@ -312,6 +319,7 @@
               --setenv TERM "''${TERM:-xterm-256color}" \
               --setenv SSL_CERT_FILE "$_SSL_CERT_FILE" \
               --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
+              --setenv NIX_CONFIG "experimental-features = nix-command flakes" \
               --setenv __NIX_AGENT_SANDBOXED 1 \
               --setenv __NIX_AGENT_SANDBOX_PWD "$PWD" \
               $_GH_ENV_ARGS \
