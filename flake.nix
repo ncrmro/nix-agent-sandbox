@@ -123,7 +123,7 @@
               exec ${pkgs.util-linux}/bin/unshare --user --mount --map-root-user -- ${pkgs.bash}/bin/bash -c '
                 # ── Phase 1: Mount operations (as mapped root) ────────
 
-                # Privatize mount tree so our changes don't propagate
+                # Privatize mount tree so our changes do not propagate
                 ${pkgs.util-linux}/bin/mount --make-rprivate /
 
                 # Scope inner agent to its own $PWD by hiding outer PWD.
