@@ -79,15 +79,31 @@ nix run github:ncrmro/nix-agent-sandbox#security-test
 
 ```
 Host OS
-  +-- Outer Ring: bubblewrap (kernel namespaces)
+  $PWD/
+    .nix/                    # gitignored, persistent across sessions
+      store/                 # overlay upper layer (new/modified store paths)
+      work/                  # overlayfs workdir
+      var/                   # nix database
+
+  +-- Outer Ring: bubblewrap (user namespace, --uid 0 --gid 0)
   |     Mount namespace: only $PWD + agent configs + certs
-  |     IPC namespace: isolated
+  |     /nix/store ← overlayfs (host store lower + .nix/store upper)
+  |     /nix/var ← bind $PWD/.nix/var (persistent DB)
+  |     PID namespace: isolated
   |     Network: allowed (API access)
-  |   +-- Inner Ring: Agent's built-in sandbox
+  |   +-- init-nix.sh (mapped root in user namespace)
+  |   |     1. If first run: nix-store --init + --load-db
+  |   |     2. Write /etc/nix/nix.conf
+  |   |     3. unshare --user --map-user=ORIG_UID -- exec agent
+  |   +-- Inner Ring: Agent's built-in sandbox (original UID)
   |         Command filtering, network restrictions, file controls
 ```
 
-The outer ring prevents the process from seeing anything outside the mount list. The inner ring provides granular control within those mounts.
+The outer ring prevents the process from seeing anything outside the mount list. bwrap's built-in `--overlay` mounts an overlayfs on `/nix/store` with the host nix store as the read-only lower layer and `$PWD/.nix/store` as the persistent upper layer. New derivations built inside the sandbox are written to the upper layer and persist across sessions.
+
+A **persistent `.nix/` directory** in `$PWD` stores the overlay upper layer and nix database. On first run, the init script initializes the nix DB and loads the agent's closure. Subsequent runs are fast — no re-downloading.
+
+**Add `.nix/` to your `.gitignore`** — it contains binary store paths that shouldn't be committed.
 
 **Sandboxed packages run in yolo mode by default** (`--dangerously-skip-permissions` for Claude, `--yolo` for Gemini/Codex). This is safe because the kernel constrains the blast radius — the agent can only access `$PWD` and its config directories regardless of what commands it runs.
 
@@ -96,6 +112,9 @@ The outer ring prevents the process from seeing anything outside the mount list.
 | Path | Mode | Purpose |
 |------|------|---------|
 | `$PWD` | read-write | Current project directory (resolved at runtime) |
+| `/nix/store` | read-write | Overlayfs: host store (lower) + `$PWD/.nix/store` (upper) |
+| `$PWD/.nix/var` → `/nix/var` | read-write | Persistent nix database |
+| `$PWD/.nix/work` | internal | Overlayfs workdir (same filesystem as upper) |
 | `~/.claude`, `~/.claude.json` | read-write | Claude auth and configuration |
 | `~/.config/claude-code` | read-write | Claude additional config |
 | `~/.gemini` | read-write | Gemini CLI auth and config |
@@ -104,13 +123,12 @@ The outer ring prevents the process from seeing anything outside the mount list.
 | `~/.config/git` | read-write | Git XDG config (credential helpers need write) |
 | `~/.ssh` | read-only | SSH keys for git operations |
 | `/etc/ssl/certs`, `/etc/hosts` | read-only | Provided by FHS rootfs |
-| `/nix/store` | read-only | Package closures for sandboxed tools |
 
-Everything else (browser data, other home directories, `/etc/shadow`) is invisible.
+Everything else (browser data, other home directories, `/etc/shadow`) is invisible. The host `/nix/store` is only visible as the read-only lower layer of the overlay — the agent cannot modify host store paths.
 
 ### What the agent can run
 
-The sandbox includes: `git`, `ripgrep`, `fd`, `coreutils`, `bash`, `grep`, `sed`, `find`, `curl`, `gh`, and `nodejs`. If an executable isn't in the `addPkgs` list, it doesn't exist in the sandbox.
+The sandbox includes: `git`, `ripgrep`, `fd`, `coreutils`, `bash`, `grep`, `sed`, `find`, `curl`, `gh`, `nodejs`, and `nix`. Nix runs in single-user mode with `sandbox = false` (nix's own sandbox cannot nest inside bwrap). Agents can run `nix build`, `nix develop`, and `nix run` to build derivations and launch sub-agents. Built paths persist in `$PWD/.nix/store` across sessions — subsequent builds are fast (cached). If an executable isn't in the `addPkgs` list, it doesn't exist in the sandbox.
 
 ## Adding to a devShell
 
@@ -282,7 +300,7 @@ Tests cover:
 - **Git config**: `~/.gitconfig` read-only, `~/.config/git` read-write
 - **SSH keys**: `~/.ssh` readable but not writable
 - **Networking**: SSL certs, DNS resolution, HTTPS connectivity
-- **Nix store**: readable but not writable
+- **Nix store**: persistent single-user mode, `nix-store --verify`, `nix build` works, privilege drop verified, no daemon socket, no host `/nix` access
 
 ## Nested sandboxes
 
@@ -315,7 +333,7 @@ The nested path provides **weaker isolation** than the outer bwrap. This is an i
 | Filesystem | Minimal — only explicit bind mounts | Inherits full outer FS view |
 | PID namespace | Isolated (`--unshare-pid`) | Shared with outer sandbox |
 | Home directory | Fresh tmpfs | Same as outer sandbox |
-| `/nix/store` | Read-only bind mount | Inherited read-only |
+| `/nix/store` | Overlayfs (host lower + persistent upper) | Inherited from outer sandbox |
 | `$PWD` scoping | Only `$PWD` bound | Outer `$PWD` hidden via tmpfs, inner `$PWD` re-exposed |
 | `~/.ssh` | Read-only bind mount | Inherited from outer (read-only) |
 
@@ -323,20 +341,18 @@ The inner agent can see everything the outer agent can see (minus the outer `$PW
 
 ### Known issues
 
-**Concurrent nesting race condition.** The inner `$PWD` is saved to a fixed path (`/tmp/.inner-pwd-save`) before the tmpfs overlay. If two sandboxed agents each spawn a nested agent simultaneously, they race on this mount point — the second agent's bind mount overwrites the first, and one nested agent ends up with the wrong (or empty) working directory. This should be changed to use `mktemp -d` for safe concurrent operation. Tracked as a TODO.
+**~~Concurrent nesting race condition.~~** Fixed — now uses `mktemp -d` for safe concurrent operation.
 
 **Path prefix check uses regex.** The `grep -q "^$_OUTER_PWD/"` check that determines whether scoping applies treats `$_OUTER_PWD` as a regex pattern. Paths containing `.`, `+`, or other regex metacharacters could match more broadly than intended. Should use `grep -qF` (fixed string) instead. Low risk since filesystem paths rarely contain these characters and the worst case is "scoping applied when it shouldn't be" (which just hides a directory that was already accessible).
 
 **No PID isolation in nested path.** The nested agent shares the outer sandbox's PID namespace. A misbehaving inner agent could `kill` the outer agent's processes. Both run as the same UID, so this isn't a privilege escalation, but it breaks process isolation between agents.
 
-**New nix store paths not visible.** The outer bwrap's `--ro-bind /nix/store /nix/store` is established at sandbox creation time. If a nested agent triggers a `nix build` (via the daemon), the new store paths exist on the host but are not visible inside the sandbox until the outer sandbox is restarted.
-
 ## Limitations
 
-- `/nix/store` is fully readable (buildFHSEnv constraint). The agent can read any derivation, not just its closure.
+- Nix runs with `sandbox = false` because nix's own build sandbox cannot nest inside bwrap's user namespace. Builds are not hermetic but the bwrap sandbox constrains filesystem access.
 - Network is all-or-nothing. Restricting to specific API hosts requires an external proxy or nftables rules.
 - Linux only (bubblewrap uses kernel namespaces).
-- The NixOS DNS fix depends on nix-bwrapper's internal `etc_ignored` variable name remaining stable.
+- The `.nix/` directory grows with each build. Periodically delete it to reclaim space: `rm -rf .nix/`
 
 ## Credits
 

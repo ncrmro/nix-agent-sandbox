@@ -156,9 +156,14 @@ else
 fi
 
 echo ""
-echo "[Nix Store -- read-only access expected]"
+echo "[Nix Store -- persistent single-user mode]"
 run_test "Read /nix/store"                           allowed "test -d /nix/store"
-run_test "Write to /nix/store"                       blocked "touch /nix/store/sandbox-test"
+run_test "nix-store --verify succeeds"               allowed "nix-store --verify 2>/dev/null"
+run_test "nix build nixpkgs#hello"                   allowed "nix build nixpkgs#hello --no-link 2>&1"
+run_test "Built output visible in /nix/store"        allowed "nix build nixpkgs#hello --print-out-paths 2>&1 | head -1 | xargs test -d"
+run_test "Agent UID is not 0 (privilege drop)"       allowed "test \$(id -u) -ne 0"
+run_test "No nix daemon socket present"              blocked "test -S /nix/var/nix/daemon-socket/socket"
+run_test "No host /nix/store access"                 blocked "test -f /nix/store/.host-marker 2>/dev/null"
 
 echo ""
 echo "============================================"

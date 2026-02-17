@@ -66,8 +66,57 @@
           # Short name for symlink (e.g., "claude-code" -> "claude")
           shortName = builtins.head (pkgs.lib.splitString "-" package.pname);
 
+          # Closure registration for nix DB initialization inside sandbox
+          closureInfo = pkgs.closureInfo { rootPaths = addPkgs ++ [ package ]; };
+
+          # Init script: runs as mapped root inside bwrap user namespace.
+          # bwrap's --overlay mounts the overlayfs before this runs.
+          # Initializes nix DB on first run, then drops privileges and execs agent.
+          initScript = pkgs.writeShellScript "init-nix" ''
+            set -euo pipefail
+
+            # Initialize nix DB for single-user mode (first run only)
+            if [ ! -f /nix/var/nix/db/db.sqlite ]; then
+              mkdir -p /nix/var/nix/db /nix/var/nix/gcroots/per-user \
+                       /nix/var/nix/profiles/per-user /nix/var/nix/temproots \
+                       /nix/var/nix/userpool /nix/var/nix/daemon-socket
+
+              # nix-store --init tries to chown /nix/store which fails on
+              # overlayfs mount points (EINVAL in user namespaces). Workaround:
+              # temporarily mount tmpfs on /nix/store for --init (which only
+              # creates the DB schema in /nix/var), then unmount so the overlay
+              # comes back for --load-db (which needs to see the store paths).
+              ${pkgs.util-linux}/bin/mount -t tmpfs tmpfs /nix/store
+              ${pkgs.nix}/bin/nix-store --init
+              ${pkgs.util-linux}/bin/umount /nix/store
+
+              # Now overlay is visible again — register closure paths in DB
+              ${pkgs.nix}/bin/nix-store --load-db < /nix/.closure-registration
+
+              # Create .links dir on overlay (nix expects it for deduplication)
+              mkdir -p /nix/store/.links
+            fi
+
+            # Write nix.conf for single-user mode.
+            mkdir -p /etc/nix
+            cat > /etc/nix/nix.conf << NIXCONF
+experimental-features = nix-command flakes
+sandbox = false
+NIXCONF
+
+            # Drop root and exec the agent
+            exec ${pkgs.util-linux}/bin/unshare \
+              --user --map-user="$__SANDBOX_ORIG_UID" --map-group="$__SANDBOX_ORIG_GID" -- "$@"
+          '';
+
           wrapperScript = pkgs.writeShellScript "agent-sandbox" ''
             set -euo pipefail
+
+            # ── Create persistent .nix directory ─────────────────────
+            # Store paths and nix DB persist across sessions for fast startup.
+            # .work is the overlayfs workdir (must be on same fs as upper).
+            # Add .nix/ to your .gitignore.
+            mkdir -p "$PWD/.nix/store" "$PWD/.nix/var" "$PWD/.nix/work"
 
             # ── Nested sandbox detection ─────────────────────────────
             #
@@ -143,6 +192,30 @@
                   mkdir -p "$PWD"
                   ${pkgs.util-linux}/bin/mount --bind "$_SAVE" "$PWD"
                 fi
+
+                # ── Nix config (inherited persistent store from outer sandbox) ────
+                # Write nix.conf so nix-command and flakes work
+                mkdir -p /etc/nix
+                cat > /etc/nix/nix.conf << NIXCONF
+experimental-features = nix-command flakes
+sandbox = false
+NIXCONF
+
+                # The persistent .nix/ is inherited from outer sandbox and already
+                # initialized. Just verify DB exists (should always be true).
+                if [ ! -f /nix/var/nix/db/db.sqlite ]; then
+                  # Fallback: initialize if somehow missing
+                  mkdir -p /nix/var/nix/db /nix/var/nix/gcroots/per-user \
+                           /nix/var/nix/profiles/per-user /nix/var/nix/temproots \
+                           /nix/var/nix/userpool /nix/var/nix/daemon-socket
+                  ${pkgs.nix}/bin/nix-store --init
+                  if [ -f /nix/.closure-registration ]; then
+                    ${pkgs.nix}/bin/nix-store --load-db < /nix/.closure-registration
+                  fi
+                fi
+
+                # Fix /nix ownership for privilege drop
+                chown -R 0:0 /nix/store /nix/var 2>/dev/null || true
 
                 # ── Phase 2: Drop root and execute agent ──────────────
                 cd "$PWD"
@@ -273,12 +346,6 @@
               fi
             done
 
-            # Nix daemon socket (read-only, for nix run/build inside sandbox)
-            _NIX_DAEMON_SOCKET="/nix/var/nix/daemon-socket/socket"
-            if [ -S "$_NIX_DAEMON_SOCKET" ]; then
-              _OPTIONAL_BINDS="$_OPTIONAL_BINDS --bind /nix/var/nix/daemon-socket /nix/var/nix/daemon-socket"
-            fi
-
             # ── GitHub token env vars ───────────────────────────────
             _GH_ENV_ARGS=""
             ${pkgs.lib.optionalString (githubTokenPath != null) ''
@@ -295,13 +362,25 @@
               '') env
             )}
 
+            # ── Capture original UID/GID for privilege drop ─────────
+            _ORIG_UID=$(id -u)
+            _ORIG_GID=$(id -g)
+
             # ── Execute in sandbox ──────────────────────────────────
+            # bwrap's --overlay mounts overlayfs natively:
+            #   - Host /nix/store as lower layer (read-only source)
+            #   - $PWD/.nix/store as upper layer (persistent writes)
+            #   - $PWD/.nix/work as overlayfs workdir
+            # init-nix initializes nix DB, drops privileges, execs agent.
             exec ${pkgs.bubblewrap}/bin/bwrap \
               --dev /dev \
               --proc /proc \
               --tmpfs /tmp \
               --tmpfs "$HOME" \
-              --ro-bind /nix/store /nix/store \
+              --overlay-src /nix/store \
+              --overlay "$PWD/.nix/store" "$PWD/.nix/work" /nix/store \
+              --bind "$PWD/.nix/var" /nix/var \
+              --ro-bind ${closureInfo}/registration /nix/.closure-registration \
               --symlink ${pkgs.coreutils}/bin/env /usr/bin/env \
               --symlink ${pkgs.bash}/bin/bash /bin/sh \
               --ro-bind "$_RESOLV" /etc/resolv.conf \
@@ -314,6 +393,7 @@
               --chdir "$PWD" \
               --die-with-parent \
               --unshare-pid \
+              --unshare-user --uid 0 --gid 0 \
               --setenv PATH "${mainBin}:${pathString}" \
               --setenv HOME "$HOME" \
               --setenv TERM "''${TERM:-xterm-256color}" \
@@ -322,10 +402,12 @@
               --setenv NIX_CONFIG "experimental-features = nix-command flakes" \
               --setenv __NIX_AGENT_SANDBOXED 1 \
               --setenv __NIX_AGENT_SANDBOX_PWD "$PWD" \
+              --setenv __SANDBOX_ORIG_UID "$_ORIG_UID" \
+              --setenv __SANDBOX_ORIG_GID "$_ORIG_GID" \
               $_GH_ENV_ARGS \
               ''${_GIT_SSH_COMMAND:+--setenv GIT_SSH_COMMAND "$_GIT_SSH_COMMAND"} \
               $_CUSTOM_ENV_ARGS \
-              ${runScript} "$@"
+              ${initScript} ${runScript} "$@"
           '';
         in pkgs.runCommand "${package.pname}-sandbox" {
           meta = package.meta or {} // {
@@ -410,7 +492,7 @@
             pkgs = pkgs;
             package = testPkg;
             runScript = "security-test";
-            addPkgs = with pkgs; [ coreutils bash curl gh git openssh ];
+            addPkgs = with pkgs; [ coreutils bash curl gh git openssh nix util-linux ];
           };
         }
       );
