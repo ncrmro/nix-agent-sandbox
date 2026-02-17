@@ -73,11 +73,11 @@
             set -euo pipefail
 
             # ── Create persistent .nix directory ─────────────────────
-            # .upper is the overlayfs upper layer for /nix (new store paths go here).
+            # .store is the overlayfs upper layer (new/modified store paths).
             # .work is the overlayfs workdir (must be on same fs as upper).
-            # .var holds the nix database (bind-mounted over the overlay).
+            # .var holds the nix database (bind-mounted separately).
             # Add .nix/ to your .gitignore.
-            mkdir -p "$PWD/.nix/upper" "$PWD/.nix/var" "$PWD/.nix/work"
+            mkdir -p "$PWD/.nix/store" "$PWD/.nix/var" "$PWD/.nix/work"
 
             # ── Initialize nix DB on host (first run only) ────────────
             # Must happen BEFORE entering bwrap because nix-store --init
@@ -343,23 +343,25 @@ NIXCONF
             )}
 
             # ── Execute in sandbox ──────────────────────────────────
-            # bwrap's --overlay mounts overlayfs natively at /nix:
-            #   - Host /nix as lower layer (read-only source)
-            #   - $PWD/.nix/upper as upper layer (persistent writes)
+            # bwrap's --overlay mounts overlayfs natively:
+            #   - Host /nix/store as lower layer (read-only source)
+            #   - $PWD/.nix/store as upper layer (persistent writes)
             #   - $PWD/.nix/work as overlayfs workdir
-            # Overlaying at /nix (not /nix/store) is critical: nix chowns
-            # /nix/store on startup, and chown on an overlayfs mount-point
-            # root returns EINVAL. With overlay at /nix, /nix/store is a
-            # subdirectory — chown triggers a normal copy-up and succeeds.
-            # /nix/var is bind-mounted AFTER the overlay to override it
-            # with the persistent DB from $PWD/.nix/var.
+            # The user namespace (--unshare-user) is required for unprivileged
+            # overlayfs. We map to the ORIGINAL uid/gid (not root) so that
+            # nix skips the "chown /nix/store" call in LocalStore init —
+            # that call returns EINVAL on overlayfs mount-point roots.
+            # The user namespace still grants all ns capabilities (CAP_FOWNER
+            # etc.) so nix can chmod/chown newly built store paths.
+            _UID=$(id -u)
+            _GID=$(id -g)
             exec ${pkgs.bubblewrap}/bin/bwrap \
               --dev /dev \
               --proc /proc \
               --tmpfs /tmp \
               --tmpfs "$HOME" \
-              --overlay-src /nix \
-              --overlay "$PWD/.nix/upper" "$PWD/.nix/work" /nix \
+              --overlay-src /nix/store \
+              --overlay "$PWD/.nix/store" "$PWD/.nix/work" /nix/store \
               --bind "$PWD/.nix/var" /nix/var \
               --ro-bind ${closureInfo}/registration /nix/.closure-registration \
               --symlink ${pkgs.coreutils}/bin/env /usr/bin/env \
@@ -374,7 +376,7 @@ NIXCONF
               --chdir "$PWD" \
               --die-with-parent \
               --unshare-pid \
-              --unshare-user --uid 0 --gid 0 \
+              --unshare-user --uid "$_UID" --gid "$_GID" \
               --setenv PATH "${mainBin}:${pathString}" \
               --setenv HOME "$HOME" \
               --setenv TERM "''${TERM:-xterm-256color}" \
@@ -382,7 +384,6 @@ NIXCONF
               --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
               --setenv NIX_CONFIG "experimental-features = nix-command flakes
 sandbox = false" \
-              --setenv IS_SANDBOX 1 \
               --setenv __NIX_AGENT_SANDBOXED 1 \
               --setenv __NIX_AGENT_SANDBOX_PWD "$PWD" \
               $_GH_ENV_ARGS \

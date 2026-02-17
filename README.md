@@ -81,21 +81,21 @@ nix run github:ncrmro/nix-agent-sandbox#security-test
 Host OS
   $PWD/
     .nix/                    # gitignored, persistent across sessions
-      upper/                 # overlay upper layer (new/modified paths)
+      store/                 # overlay upper layer (new/modified store paths)
       work/                  # overlayfs workdir
       var/                   # nix database
 
-  +-- Outer Ring: bubblewrap (user namespace, --uid 0 --gid 0)
+  +-- Outer Ring: bubblewrap (user namespace, --uid $UID --gid $GID)
   |     Mount namespace: only $PWD + agent configs + certs
-  |     /nix ← overlayfs (host /nix lower + .nix/upper upper)
-  |     /nix/var ← bind $PWD/.nix/var (overrides overlay)
+  |     /nix/store ← overlayfs (host store lower + .nix/store upper)
+  |     /nix/var ← bind $PWD/.nix/var (persistent DB)
   |     PID namespace: isolated
   |     Network: allowed (API access)
-  |   +-- Agent runs as uid 0 in user namespace (IS_SANDBOX=1)
+  |   +-- Agent runs as original UID (not root)
   |         Command filtering, network restrictions, file controls
 ```
 
-The outer ring prevents the process from seeing anything outside the mount list. bwrap's built-in `--overlay` mounts an overlayfs on `/nix` (not `/nix/store`) with the host `/nix` as the read-only lower layer and `$PWD/.nix/upper` as the persistent upper layer. The overlay is at `/nix` rather than `/nix/store` because nix chowns `/nix/store` on startup, and chown on an overlayfs mount-point root returns EINVAL — with the overlay at `/nix`, `/nix/store` is a subdirectory where chown triggers a normal copy-up. `/nix/var` is bind-mounted on top of the overlay to provide the persistent nix database. New derivations built inside the sandbox are written to the upper layer and persist across sessions.
+The outer ring prevents the process from seeing anything outside the mount list. bwrap's built-in `--overlay` mounts an overlayfs on `/nix/store` with the host nix store as the read-only lower layer and `$PWD/.nix/store` as the persistent upper layer. The agent runs as its original UID (not root) inside a user namespace — this avoids nix's root-only `chown /nix/store` call which returns EINVAL on overlayfs mount-point roots. The user namespace still grants all namespace capabilities (CAP_FOWNER, etc.) so nix can chmod/chown newly built store paths. New derivations are written to the upper layer and persist across sessions.
 
 A **persistent `.nix/` directory** in `$PWD` stores the overlay upper layer and nix database. On first run, the wrapper script initializes the nix DB and loads the agent's closure on the host (before entering bwrap). Subsequent runs are fast — no re-downloading.
 
@@ -108,8 +108,8 @@ A **persistent `.nix/` directory** in `$PWD` stores the overlay upper layer and 
 | Path | Mode | Purpose |
 |------|------|---------|
 | `$PWD` | read-write | Current project directory (resolved at runtime) |
-| `/nix` | read-write | Overlayfs: host `/nix` (lower) + `$PWD/.nix/upper` (upper) |
-| `$PWD/.nix/var` → `/nix/var` | read-write | Persistent nix database (overrides overlay) |
+| `/nix/store` | read-write | Overlayfs: host store (lower) + `$PWD/.nix/store` (upper) |
+| `$PWD/.nix/var` → `/nix/var` | read-write | Persistent nix database |
 | `$PWD/.nix/work` | internal | Overlayfs workdir (same filesystem as upper) |
 | `~/.claude`, `~/.claude.json` | read-write | Claude auth and configuration |
 | `~/.config/claude-code` | read-write | Claude additional config |
