@@ -73,10 +73,11 @@
             set -euo pipefail
 
             # ── Create persistent .nix directory ─────────────────────
-            # Store paths and nix DB persist across sessions for fast startup.
+            # .upper is the overlayfs upper layer for /nix (new store paths go here).
             # .work is the overlayfs workdir (must be on same fs as upper).
+            # .var holds the nix database (bind-mounted over the overlay).
             # Add .nix/ to your .gitignore.
-            mkdir -p "$PWD/.nix/store" "$PWD/.nix/var" "$PWD/.nix/work"
+            mkdir -p "$PWD/.nix/upper" "$PWD/.nix/var" "$PWD/.nix/work"
 
             # ── Initialize nix DB on host (first run only) ────────────
             # Must happen BEFORE entering bwrap because nix-store --init
@@ -342,18 +343,23 @@ NIXCONF
             )}
 
             # ── Execute in sandbox ──────────────────────────────────
-            # bwrap's --overlay mounts overlayfs natively:
-            #   - Host /nix/store as lower layer (read-only source)
-            #   - $PWD/.nix/store as upper layer (persistent writes)
+            # bwrap's --overlay mounts overlayfs natively at /nix:
+            #   - Host /nix as lower layer (read-only source)
+            #   - $PWD/.nix/upper as upper layer (persistent writes)
             #   - $PWD/.nix/work as overlayfs workdir
-            # DB is pre-initialized on host. NIX_CONFIG provides nix settings.
+            # Overlaying at /nix (not /nix/store) is critical: nix chowns
+            # /nix/store on startup, and chown on an overlayfs mount-point
+            # root returns EINVAL. With overlay at /nix, /nix/store is a
+            # subdirectory — chown triggers a normal copy-up and succeeds.
+            # /nix/var is bind-mounted AFTER the overlay to override it
+            # with the persistent DB from $PWD/.nix/var.
             exec ${pkgs.bubblewrap}/bin/bwrap \
               --dev /dev \
               --proc /proc \
               --tmpfs /tmp \
               --tmpfs "$HOME" \
-              --overlay-src /nix/store \
-              --overlay "$PWD/.nix/store" "$PWD/.nix/work" /nix/store \
+              --overlay-src /nix \
+              --overlay "$PWD/.nix/upper" "$PWD/.nix/work" /nix \
               --bind "$PWD/.nix/var" /nix/var \
               --ro-bind ${closureInfo}/registration /nix/.closure-registration \
               --symlink ${pkgs.coreutils}/bin/env /usr/bin/env \
