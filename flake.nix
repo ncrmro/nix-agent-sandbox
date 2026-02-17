@@ -101,49 +101,54 @@
             #
             if [ "''${__NIX_AGENT_SANDBOXED:-}" = "1" ]; then
               # Already inside a bwrap sandbox — cannot nest bwrap.
-              # Fall back to unshare --user --mount for lightweight namespace isolation.
-              # --user is required because bwrap drops all capabilities (CapEff=0).
-              # --map-root-user maps our UID to root inside the user namespace so
-              # mount(8) syscalls are permitted.
+              #
+              # Strategy: two-phase namespace setup.
+              #
+              # Phase 1 (outer unshare): --user --mount --map-root-user
+              #   Creates user + mount namespace with UID mapped to root.
+              #   Root is needed for mount(8) syscalls (tmpfs, bind mounts).
+              #   We do all mount operations in this phase.
+              #
+              # Phase 2 (inner unshare): --user --map-user=<orig> --map-group=<orig>
+              #   Creates a nested user namespace that remaps root back to the
+              #   original UID/GID. This is required because some agents (e.g.,
+              #   Claude Code) refuse to run as root for security reasons.
+              #   The mount namespace from Phase 1 is inherited — mounts persist.
+              #
+              # UID/GID are passed via env vars to avoid quoting issues across
+              # the multiple shell/Nix string nesting layers.
+              export __SANDBOX_ORIG_UID=$(id -u)
+              export __SANDBOX_ORIG_GID=$(id -g)
               export PATH="${mainBin}:${pathString}:$PATH"
               exec ${pkgs.util-linux}/bin/unshare --user --mount --map-root-user -- ${pkgs.bash}/bin/bash -c '
-                # ── Step 1: Privatize mount tree ──────────────────────
-                # By default, mount namespaces share propagation with the parent.
-                # Making everything rprivate ensures our tmpfs overlay and bind
-                # mounts are invisible to the outer sandbox.
+                # ── Phase 1: Mount operations (as mapped root) ────────
+
+                # Privatize mount tree so our changes don't propagate
                 ${pkgs.util-linux}/bin/mount --make-rprivate /
 
-                # ── Step 2: Scope inner agent to its own $PWD ─────────
-                # __NIX_AGENT_SANDBOX_PWD holds the outer sandbox PWD (e.g., the
-                # vault root). If our $PWD is a subdirectory of that (e.g., a
-                # worktree inside the vault), we hide the outer PWD with tmpfs
-                # and then re-expose just our specific $PWD via bind mount.
-                #
+                # Scope inner agent to its own $PWD by hiding outer PWD.
                 # The inner $PWD content must be saved to a temp mount point
-                # BEFORE overlaying tmpfs on the outer PWD, because the inner
-                # path lives under the outer path and would be hidden otherwise.
+                # BEFORE overlaying tmpfs, because it lives under the outer path.
                 #
                 # Example:
-                #   Outer PWD = /home/user/vault       (the vault root)
-                #   Inner PWD = /home/user/vault/.repos/owner/repo/.worktrees/feature
-                #   Result: /home/user/vault is empty tmpfs, but the worktree
-                #           path is bind-mounted back and fully accessible.
+                #   Outer PWD = /home/user/vault
+                #   Inner PWD = /home/user/vault/.repos/owner/repo
+                #   Result: vault root is empty tmpfs, repo is accessible
                 _OUTER_PWD="''${__NIX_AGENT_SANDBOX_PWD:-}"
                 if [ -n "$_OUTER_PWD" ] && [ "$_OUTER_PWD" != "$PWD" ] && echo "$PWD" | grep -q "^$_OUTER_PWD/"; then
-                  # Save inner PWD to temp location before hiding outer
                   _SAVE=/tmp/.inner-pwd-save
                   mkdir -p "$_SAVE"
                   ${pkgs.util-linux}/bin/mount --bind "$PWD" "$_SAVE"
-                  # Overlay tmpfs hides the entire outer PWD tree
                   ${pkgs.util-linux}/bin/mount -t tmpfs tmpfs "$_OUTER_PWD"
-                  # Recreate the inner PWD path on the tmpfs and bind from saved
                   mkdir -p "$PWD"
                   ${pkgs.util-linux}/bin/mount --bind "$_SAVE" "$PWD"
                 fi
 
-                # ── Step 3: Execute the agent ─────────────────────────
+                # ── Phase 2: Drop root and execute agent ──────────────
                 cd "$PWD"
-                exec '"${runScript}"' "$@"
+                exec ${pkgs.util-linux}/bin/unshare \
+                  --user --map-user="$__SANDBOX_ORIG_UID" --map-group="$__SANDBOX_ORIG_GID" -- \
+                  '"${runScript}"' "$@"
               ' -- "$@"
             fi
 
