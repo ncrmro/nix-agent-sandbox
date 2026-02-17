@@ -284,6 +284,53 @@ Tests cover:
 - **Networking**: SSL certs, DNS resolution, HTTPS connectivity
 - **Nix store**: readable but not writable
 
+## Nested sandboxes
+
+When a sandboxed agent launches another sandboxed agent (e.g., Claude Code spawning Gemini CLI), bubblewrap cannot nest — `pivot_root` fails inside an existing bwrap namespace ([bubblewrap#164](https://github.com/containers/bubblewrap/issues/164), [#273](https://github.com/containers/bubblewrap/issues/273), [#543](https://github.com/containers/bubblewrap/issues/543)). The wrapper detects nesting via the `__NIX_AGENT_SANDBOXED=1` sentinel and falls back to `unshare --user --mount` for the inner agent.
+
+### How it works
+
+```
+Host OS
+  +-- Outer Ring: bubblewrap (full isolation)
+  |     Mount namespace, PID namespace, tmpfs $HOME
+  |     Only $PWD + agent configs + certs visible
+  |   +-- Inner Ring: unshare --user --mount (scoped)
+  |         Mount namespace only (inherits outer FS view)
+  |         Hides outer $PWD via tmpfs overlay
+  |         Re-exposes only the inner agent's $PWD
+```
+
+Two-phase namespace setup:
+1. `unshare --user --mount --map-root-user` creates a user namespace with root mapping (needed for `mount(8)` syscalls since bwrap drops all capabilities)
+2. Mount operations hide the outer `$PWD` and re-expose the inner worktree
+3. `unshare --user --map-user=<orig> --map-group=<orig>` drops back to the original UID/GID before exec'ing the agent (some agents refuse to run as root)
+
+### Isolation differences vs. first-level sandbox
+
+The nested path provides **weaker isolation** than the outer bwrap. This is an inherent limitation, not a bug.
+
+| Property | First-level (bwrap) | Nested (unshare) |
+|----------|-------------------|-----------------|
+| Filesystem | Minimal — only explicit bind mounts | Inherits full outer FS view |
+| PID namespace | Isolated (`--unshare-pid`) | Shared with outer sandbox |
+| Home directory | Fresh tmpfs | Same as outer sandbox |
+| `/nix/store` | Read-only bind mount | Inherited read-only |
+| `$PWD` scoping | Only `$PWD` bound | Outer `$PWD` hidden via tmpfs, inner `$PWD` re-exposed |
+| `~/.ssh` | Read-only bind mount | Inherited from outer (read-only) |
+
+The inner agent can see everything the outer agent can see (minus the outer `$PWD`). It can also signal processes in the outer sandbox (shared PID namespace).
+
+### Known issues
+
+**Concurrent nesting race condition.** The inner `$PWD` is saved to a fixed path (`/tmp/.inner-pwd-save`) before the tmpfs overlay. If two sandboxed agents each spawn a nested agent simultaneously, they race on this mount point — the second agent's bind mount overwrites the first, and one nested agent ends up with the wrong (or empty) working directory. This should be changed to use `mktemp -d` for safe concurrent operation. Tracked as a TODO.
+
+**Path prefix check uses regex.** The `grep -q "^$_OUTER_PWD/"` check that determines whether scoping applies treats `$_OUTER_PWD` as a regex pattern. Paths containing `.`, `+`, or other regex metacharacters could match more broadly than intended. Should use `grep -qF` (fixed string) instead. Low risk since filesystem paths rarely contain these characters and the worst case is "scoping applied when it shouldn't be" (which just hides a directory that was already accessible).
+
+**No PID isolation in nested path.** The nested agent shares the outer sandbox's PID namespace. A misbehaving inner agent could `kill` the outer agent's processes. Both run as the same UID, so this isn't a privilege escalation, but it breaks process isolation between agents.
+
+**New nix store paths not visible.** The outer bwrap's `--ro-bind /nix/store /nix/store` is established at sandbox creation time. If a nested agent triggers a `nix build` (via the daemon), the new store paths exist on the host but are not visible inside the sandbox until the outer sandbox is restarted.
+
 ## Limitations
 
 - `/nix/store` is fully readable (buildFHSEnv constraint). The agent can read any derivation, not just its closure.

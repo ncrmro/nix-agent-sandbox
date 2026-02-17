@@ -135,9 +135,8 @@
                 #   Inner PWD = /home/user/vault/.repos/owner/repo
                 #   Result: vault root is empty tmpfs, repo is accessible
                 _OUTER_PWD="''${__NIX_AGENT_SANDBOX_PWD:-}"
-                if [ -n "$_OUTER_PWD" ] && [ "$_OUTER_PWD" != "$PWD" ] && echo "$PWD" | grep -q "^$_OUTER_PWD/"; then
-                  _SAVE=/tmp/.inner-pwd-save
-                  mkdir -p "$_SAVE"
+                if [ -n "$_OUTER_PWD" ] && [ "$_OUTER_PWD" != "$PWD" ] && echo "$PWD" | grep -qF "$_OUTER_PWD/"; then
+                  _SAVE=$(mktemp -d /tmp/.inner-pwd-save.XXXXXX)
                   ${pkgs.util-linux}/bin/mount --bind "$PWD" "$_SAVE"
                   ${pkgs.util-linux}/bin/mount -t tmpfs tmpfs "$_OUTER_PWD"
                   mkdir -p "$PWD"
