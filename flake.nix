@@ -69,104 +69,6 @@
           # Closure registration for nix DB initialization inside sandbox
           closureInfo = pkgs.closureInfo { rootPaths = addPkgs ++ [ package ]; };
 
-          # LD_PRELOAD shim for overlayfs in user namespaces.
-          #
-          # Two problems with overlayfs + user namespaces:
-          # 1. chown on the overlay mount-point root (/nix/store) returns
-          #    EINVAL — the root inode can't be copied up.
-          # 2. chmod/chown on paths copied up from the lower layer (host
-          #    store) returns EPERM — overlayfs's setattr_prepare checks
-          #    permissions with caller credentials BEFORE ovl_override_creds,
-          #    and user-namespace capabilities don't apply to the init ns.
-          #
-          # Fix: intercept chmod/chown/lchown. For /nix/store (exact), always
-          # return 0. For /nix/store/* paths, try the real call first; if it
-          # returns EPERM or EINVAL, return 0 (the lower-layer path already
-          # has correct permissions from the host nix store).
-          overlayChownShim = pkgs.stdenv.mkDerivation {
-            name = "overlayfs-store-shim";
-            dontUnpack = true;
-            buildPhase = ''
-              cat > shim.c << 'CSRC'
-              #define _GNU_SOURCE
-              #include <dlfcn.h>
-              #include <errno.h>
-              #include <fcntl.h>
-              #include <string.h>
-              #include <sys/stat.h>
-              #include <sys/types.h>
-              #include <unistd.h>
-
-              /* Prefix for paths we intercept */
-              #define STORE "/nix/store"
-              #define STORE_LEN 10
-
-              static int is_store_path(const char *path) {
-                  if (!path) return 0;
-                  return strncmp(path, STORE, STORE_LEN) == 0
-                      && (path[STORE_LEN] == '\0' || path[STORE_LEN] == '/');
-              }
-
-              /* Silently succeed for EPERM/EINVAL on store paths.
-               * Lower-layer paths already have correct metadata from host nix. */
-              #define STORE_SHIM_CHECK(ret) \
-                  if (ret == -1 && (errno == EPERM || errno == EINVAL)) return 0; \
-                  return ret;
-
-              /* Path-based wrappers */
-              static int (*real_chown)(const char *, uid_t, gid_t) = NULL;
-              static int (*real_lchown)(const char *, uid_t, gid_t) = NULL;
-              static int (*real_chmod)(const char *, mode_t) = NULL;
-
-              int chown(const char *path, uid_t o, gid_t g) {
-                  if (!real_chown) real_chown = dlsym(RTLD_NEXT, "chown");
-                  if (!is_store_path(path)) return real_chown(path, o, g);
-                  if (path[STORE_LEN] == '\0') return 0;
-                  int r = real_chown(path, o, g); STORE_SHIM_CHECK(r);
-              }
-
-              int lchown(const char *path, uid_t o, gid_t g) {
-                  if (!real_lchown) real_lchown = dlsym(RTLD_NEXT, "lchown");
-                  if (!is_store_path(path)) return real_lchown(path, o, g);
-                  if (path[STORE_LEN] == '\0') return 0;
-                  int r = real_lchown(path, o, g); STORE_SHIM_CHECK(r);
-              }
-
-              int chmod(const char *path, mode_t m) {
-                  if (!real_chmod) real_chmod = dlsym(RTLD_NEXT, "chmod");
-                  if (!is_store_path(path)) return real_chmod(path, m);
-                  if (path[STORE_LEN] == '\0') return 0;
-                  int r = real_chmod(path, m); STORE_SHIM_CHECK(r);
-              }
-
-              /* *at variants — nix or glibc may use these internally */
-              static int (*real_fchmodat)(int, const char *, mode_t, int) = NULL;
-              static int (*real_fchownat)(int, const char *, uid_t, gid_t, int) = NULL;
-
-              int fchmodat(int dirfd, const char *path, mode_t m, int flags) {
-                  if (!real_fchmodat) real_fchmodat = dlsym(RTLD_NEXT, "fchmodat");
-                  if (dirfd != AT_FDCWD || !is_store_path(path))
-                      return real_fchmodat(dirfd, path, m, flags);
-                  if (path[STORE_LEN] == '\0') return 0;
-                  int r = real_fchmodat(dirfd, path, m, flags); STORE_SHIM_CHECK(r);
-              }
-
-              int fchownat(int dirfd, const char *path, uid_t o, gid_t g, int flags) {
-                  if (!real_fchownat) real_fchownat = dlsym(RTLD_NEXT, "fchownat");
-                  if (dirfd != AT_FDCWD || !is_store_path(path))
-                      return real_fchownat(dirfd, path, o, g, flags);
-                  if (path[STORE_LEN] == '\0') return 0;
-                  int r = real_fchownat(dirfd, path, o, g, flags); STORE_SHIM_CHECK(r);
-              }
-              CSRC
-              $CC -shared -fPIC -o libovl-store-shim.so shim.c -ldl
-            '';
-            installPhase = ''
-              mkdir -p $out/lib
-              cp libovl-store-shim.so $out/lib/
-            '';
-          };
-
           wrapperScript = pkgs.writeShellScript "agent-sandbox" ''
             set -euo pipefail
 
@@ -175,7 +77,7 @@
             # .work is the overlayfs workdir (must be on same fs as upper).
             # .var holds the nix database (bind-mounted separately).
             # Add .nix/ to your .gitignore.
-            mkdir -p "$PWD/.nix/store" "$PWD/.nix/var" "$PWD/.nix/work"
+            mkdir -p "$PWD/.nix/store" "$PWD/.nix/var" "$PWD/.nix/work" "$PWD/.nix/merged"
 
             # ── Initialize nix DB on host (first run only) ────────────
             # Must happen BEFORE entering bwrap because nix-store --init
@@ -440,24 +342,37 @@ NIXCONF
               '') env
             )}
 
+            # ── Mount fuse-overlayfs on host ─────────────────────────
+            # Uses fuse-overlayfs instead of kernel overlayfs because:
+            #   - Kernel overlayfs setattr_prepare checks permissions with
+            #     caller credentials BEFORE ovl_override_creds, so user-ns
+            #     capabilities don't help for chmod/chown on copied-up paths.
+            #   - Nix uses raw syscalls that bypass LD_PRELOAD interception.
+            #   - fuse-overlayfs handles permissions in userspace with
+            #     squash_to_uid/gid so all files appear owned by the caller.
+            _UID=$(id -u)
+            _GID=$(id -g)
+            ${pkgs.fuse-overlayfs}/bin/fuse-overlayfs \
+              -o "lowerdir=/nix/store,upperdir=$PWD/.nix/store,workdir=$PWD/.nix/work" \
+              -o "squash_to_uid=$_UID,squash_to_gid=$_GID" \
+              "$PWD/.nix/merged"
+
+            _cleanup() { ${pkgs.fuse3}/bin/fusermount3 -uz "$PWD/.nix/merged" 2>/dev/null || true; }
+            trap _cleanup EXIT
+
             # ── Execute in sandbox ──────────────────────────────────
-            # bwrap's --overlay mounts overlayfs natively:
-            #   - Host /nix/store as lower layer (read-only source)
-            #   - $PWD/.nix/store as upper layer (persistent writes)
-            #   - $PWD/.nix/work as overlayfs workdir
-            # Running as uid 0 in user namespace (--uid 0 --gid 0) is
-            # required because nix needs CAP_FOWNER for chmod/chown on
-            # store paths copied up from the overlay lower layer (host
-            # store paths owned by real root appear as nobody in the ns).
-            # The LD_PRELOAD shim intercepts lchown on /nix/store itself
-            # because overlayfs returns EINVAL for chown on its mount root.
-            exec ${pkgs.bubblewrap}/bin/bwrap \
+            # The fuse-overlayfs merged view is bind-mounted as /nix/store.
+            # squash_to_uid makes all store paths appear owned by the caller,
+            # so chmod/chown on copied-up paths works through FUSE userspace.
+            # --uid 0 --gid 0 maps the caller to root in the user namespace
+            # (needed for nix single-user mode). IS_SANDBOX=1 tells Claude
+            # Code to accept running as uid 0.
+            ${pkgs.bubblewrap}/bin/bwrap \
               --dev /dev \
               --proc /proc \
               --tmpfs /tmp \
               --tmpfs "$HOME" \
-              --overlay-src /nix/store \
-              --overlay "$PWD/.nix/store" "$PWD/.nix/work" /nix/store \
+              --bind "$PWD/.nix/merged" /nix/store \
               --bind "$PWD/.nix/var" /nix/var \
               --ro-bind ${closureInfo}/registration /nix/.closure-registration \
               --symlink ${pkgs.coreutils}/bin/env /usr/bin/env \
@@ -480,7 +395,6 @@ NIXCONF
               --setenv SSL_CERT_DIR "$_SSL_CERT_DIR" \
               --setenv NIX_CONFIG "experimental-features = nix-command flakes
 sandbox = false" \
-              --setenv LD_PRELOAD "${overlayChownShim}/lib/libovl-store-shim.so" \
               --setenv IS_SANDBOX 1 \
               --setenv __NIX_AGENT_SANDBOXED 1 \
               --setenv __NIX_AGENT_SANDBOX_PWD "$PWD" \

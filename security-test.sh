@@ -157,13 +157,6 @@ fi
 
 echo ""
 echo "[Nix Store -- persistent single-user mode]"
-echo "  [DEBUG] LD_PRELOAD: ${LD_PRELOAD:-not set}"
-echo "  [DEBUG] shim file: $(ls ${LD_PRELOAD:-/nonexistent} 2>&1)"
-echo "  [DEBUG] id: $(id)"
-echo "  [DEBUG] DB: $(ls -la /nix/var/nix/db/db.sqlite 2>&1)"
-echo "  [DEBUG] store ls: $(ls -ld /nix/store 2>&1)"
-echo "  [DEBUG] verify: $(nix-store --verify 2>&1 | tail -5)"
-echo "  [DEBUG] build: $(nix build nixpkgs#hello --no-link 2>&1 | tail -5)"
 run_test "Read /nix/store"                           allowed "test -d /nix/store"
 run_test "nix-store --verify succeeds"               allowed "nix-store --verify 2>/dev/null"
 run_test "nix build nixpkgs#hello"                   allowed "nix build nixpkgs#hello --no-link 2>&1"

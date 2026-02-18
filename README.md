@@ -82,21 +82,26 @@ Host OS
   $PWD/
     .nix/                    # gitignored, persistent across sessions
       store/                 # overlay upper layer (new/modified store paths)
+      merged/                # fuse-overlayfs mount point
       work/                  # overlayfs workdir
       var/                   # nix database
 
+  fuse-overlayfs (on host, before bwrap)
+    lowerdir=/nix/store      # host store (read-only)
+    upperdir=$PWD/.nix/store # persistent writes
+    squash_to_uid=$(id -u)   # all files appear owned by caller
+
   +-- Outer Ring: bubblewrap (user namespace, --uid 0 --gid 0)
   |     Mount namespace: only $PWD + agent configs + certs
-  |     /nix/store ← overlayfs (host store lower + .nix/store upper)
+  |     /nix/store ← bind .nix/merged (fuse-overlayfs view)
   |     /nix/var ← bind $PWD/.nix/var (persistent DB)
   |     PID namespace: isolated
   |     Network: allowed (API access)
   |   +-- Agent runs as uid 0 in user namespace (IS_SANDBOX=1)
-  |         LD_PRELOAD shim intercepts chown on overlay root
-  |         Command filtering, network restrictions, file controls
+  |         chmod/chown handled by FUSE userspace (no kernel issues)
 ```
 
-The outer ring prevents the process from seeing anything outside the mount list. bwrap's built-in `--overlay` mounts an overlayfs on `/nix/store` with the host nix store as the read-only lower layer and `$PWD/.nix/store` as the persistent upper layer. The agent runs as uid 0 in a user namespace — this gives nix the CAP_FOWNER capability needed to chmod/chown store paths copied up from the overlay lower layer (host store paths are owned by real root, which maps to `nobody` in the namespace). An LD_PRELOAD shim intercepts the one `chown("/nix/store")` call that nix makes on startup, which would otherwise return EINVAL on the overlayfs mount-point root. New derivations are written to the upper layer and persist across sessions.
+The outer ring prevents the process from seeing anything outside the mount list. A **fuse-overlayfs** mount on the host merges the host nix store (read-only lower layer) with `$PWD/.nix/store` (persistent upper layer). The `squash_to_uid` option makes all files appear owned by the calling user, so chmod/chown operations go through FUSE userspace without kernel permission issues. The merged view is bind-mounted into bwrap as `/nix/store`. The agent runs as uid 0 in a user namespace for nix single-user mode compatibility. New derivations are written to the upper layer and persist across sessions.
 
 A **persistent `.nix/` directory** in `$PWD` stores the overlay upper layer and nix database. On first run, the wrapper script initializes the nix DB and loads the agent's closure on the host (before entering bwrap). Subsequent runs are fast — no re-downloading.
 
